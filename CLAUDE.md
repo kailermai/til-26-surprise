@@ -70,8 +70,9 @@ Writes the actual strategy. Owns:
 
 ### Person 2 — Tester + hardening (proves it's good, stops dumb losses)
 Right now we only know if we pass *one* practice game — almost no signal. Owns:
-- `tools/arena.py` — run ~30 games on random seeds headless, report **survival %**
-  and which turn/why we died. This tells Person 1 if a change actually helped.
+- `tools/arena.py` — runs many games headless and reports **survival %**, death turns,
+  and won-outright count. Tells Person 1 if a change actually helped. **Built & working**
+  — see "The arena" below.
 - Replay analysis — watch the losses, find failure modes.
 - `chat.py` — incoming-chat cap/sanitization (the DoS/injection defense).
 - `diplomacy.py` — propose/accept peace, track who we've met.
@@ -82,18 +83,24 @@ They meet only at `agent.py`, which both can stub immediately.
 ## Code layout (so the two people don't collide)
 
 ```
-participant/src/
-  state.py       SHARED — obs parsing + distance/threat/vision helpers (Person 1 owns, freeze early)
-  economy.py     build order, Base placement, expansion          (Person 1)
+participant/src/          ← SUBMITTED image; only edit here
+  algo_agent.py  the agent we submit (teammate fills this out)    (Person 1)
+  state.py       SHARED — obs parsing + distance/threat/vision    (Person 1 owns, freeze early)
+  economy.py     build order, Base placement, expansion           (Person 1)
   military.py    target selection, movement, retreat              (Person 1)
-  agent.py       decide(): wires planners together, budgets time  (Person 1)
   diplomacy.py   treaties, known_players tracking                 (Person 2)
   chat.py        incoming-chat sanitization + optional outgoing   (Person 2)
-  tools/arena.py headless multi-seed tournament + stats           (Person 2)
+
+tools/arena.py   headless multi-seed tournament + stats   (Person 2)  ← DONE, at repo root
 ```
 
-Each planner is a near-pure function of `state` → list of actions, so they merge
-cleanly in `agent.py`.
+**Why arena lives at the repo root, not in `participant/src/tools/`:** it imports the
+game harness (`game_runner`, `schemas`, `baseline_random`, `replay`) which lives in
+`server/src/`, *not* in participant — and test code must never ship inside the submitted
+image. It loads the agent under test from `participant/src/` by file path.
+
+Each strategy planner is a near-pure function of `state` → list of actions, so they merge
+cleanly in `algo_agent.py`'s `decide()`.
 
 ## Don't do these
 
@@ -109,9 +116,30 @@ cleanly in `agent.py`.
 ## How to run
 
 ```bash
-# from til-26-surprise/ — full local match, prints PASS/FAIL + writes a replay
+# full local match over HTTP — prints PASS/FAIL + writes a replay.
+# The ONLY check that enforces the real 10s deadline + 1 CPU / 1 GiB limits.
 docker compose up --build
 
-# once Person 2 builds it: fast signal across many seeds
-python participant/src/tools/arena.py
+# fast survival signal across many seeds (in-process; does NOT test the 10s limit):
+python tools/arena.py --games 50
+python tools/arena.py --opponent-agent participant/src/algo_agent.py   # a REAL test
 ```
+
+## The arena — `tools/arena.py` (Person 2's tool, already built)
+
+Runs full games in-process (no Docker/HTTP) so you can sweep many seeds fast (~15–20s
+per 300-turn game, ~3–4/min). Prints survival % with a confidence interval, median death
+turn, and won-outright count. Saves a replay **only for games you lose**, under
+`replays/arena/`. Useful flags: `--games N`, `--agent PATH`, `--opponent-agent PATH`,
+`--max-turns N`, `--map WxH`, `--no-replays`.
+
+**Findings from the first runs — read these, they shape how you test:**
+- **Survival vs the RandomAgent baseline is ~100% for everything** — even an agent that
+  does *nothing* survives. The randoms can't kill anyone. So a bare `python tools/arena.py`
+  number is meaningless; always test with `--opponent-agent participant/src/algo_agent.py`
+  (or our own agent) to get real signal.
+- **Eliminations are rare**: infantry move 1 tile/turn and bases have 300 HP on the 35×30
+  map, so destroying a base takes ages. Survival is the easy default — which is *why* the
+  meta is "don't die," and why you need a real opponent to tell strong agents from lazy ones.
+- The arena does **not** enforce the 10s/turn deadline (it calls `decide()` directly).
+  Keep `docker compose up` for that.
