@@ -202,13 +202,17 @@ python tools/postmortem.py replays/arena/seed_6.jsonl   # then 8, 9, 2, 13, ...
 ```
 
 ### Version history (self-play, seeds 1–14, same 14 seeds each time)
-- **v1**: 9/14 (64%), deaths ~236–295. Dies on ~24–28k gold, 1–2 Bases.
+- **v1**: 9/14 (64%), deaths ~236–295, **~13 survivors/game**. Dies on ~24–28k gold, 1–2 Bases.
 - **v2**: 7/14 (50%), deaths ~209–255. "Dump gold" caps + pickier base siting —
   *regressed* (a `base_site_threat>=8` gate made some seeds build only ONE Base).
-- **v3**: 9/14 (64%), deaths ~221–246 (later than v2). Opportunistic founding +
-  more Scouts. **Base count fixed**: 12–26 Bases/game (was 1–2). Gold often drained.
-- Trend is up, but n=14 CI is ±~20 pts — treat version deltas as suggestive, confirm
-  with a 50-game run before declaring a winner.
+- **v3**: 9/14 (64%), deaths ~221–246. Opportunistic founding + more Scouts.
+  **Base count fixed**: 12–26 Bases/game (was 1–2). But still died too-late + no defenders.
+- **v5**: 4/14 (29%), deaths ~216–300, **~5.5 survivors/game**. Full tech tree + whole unit
+  roster + offensive doctrine. **Read this number carefully — see "v5 assessment" below: the
+  survival drop is mostly the meta turning violent, NOT proof v5 is worse.**
+- n=14 CI is ±~20 pts. **Raw self-play % across versions is NOT a clean comparison** — the
+  opponents change with our agent (see the confound note below), so a lower number can mean
+  "we made the board deadlier," not "we got worse." Trend-watching survival % alone is a trap.
 
 ### v3 RESOLVED two earlier findings (kept for the record)
 - *Dies rich* + *base count gated by scout vision, not gold* → fixed. v3 founds a Base on
@@ -217,36 +221,60 @@ python tools/postmortem.py replays/arena/seed_6.jsonl   # then 8, 9, 2, 13, ...
 - *v2 `base_site_threat>=8` gate regressed base-founding* → confirmed and removed in v3
   (threat distance now relaxes over time: 8→6→4). ✅
 
-### v4 — the TWO failure modes v3's losses now expose (next targets)
-Post-mortem every v3 loss (seeds 6/8/9/2/13) and you see the SAME two things:
+### v4/v5 RESOLVED the two findings above (kept for the record)
+v5 post-mortems (seeds 8/11/2) confirm both v4 targets were hit:
+- *Bases founded too late* → fixed. `founded t…` now spreads across peacetime (t0, t12, t62,
+  t101, t141…) instead of bunching at t181+. `WAR_PREP_TURN = TREATY_CUTOFF−60` (turn 140). ✅
+- *Zero defenders / dies rich* → fixed. v5 builds the full tech tree + roster and dies on
+  **90–160 gold** with Infantry/Artillery/Fighters present (was `units:{}` on 27k gold). ✅
 
-1. **Bases are founded too LATE — reactively, during the war.** Founding turns cluster at
-   t0–t80, then a *dead gap* to ~t180, then a flood of 12+ Bases at **t181–t227**. The
-   aggressive expansion only triggers at turn 180 (the `late` flag = `TREATY_CUTOFF−20`),
-   so we spam Bases *after* treaties void — exactly when 19 hostile armies are hunting, and
-   each Base gets razed 1–10 turns after it completes. A hidden Base only works if it is
-   **standing and hidden BEFORE the war.** Fix direction: expand hard during the *peacetime*
-   window (turns ~50–180), while treaties protect us, so Bases are already built and
-   scattered when turn 200 hits. Verify: check the `founded t…` column spreads across
-   50–180 instead of bunching at 181+.
+### v5 assessment — survival LOOKS worse (29%) but is mostly confounded
+Do NOT revert v5 on the 64%→29% number alone. The post-mortems tell a different story:
+- **The board became a bloodbath.** Survivors/game fell ~13 (v1/v3) → ~5.5 (v5) because v5's
+  offensive doctrine made all 20 self-play copies aggressive. Lower survival is largely the
+  *meta* getting deadlier, not our agent getting worse — self-play can't separate the two.
+- **Real remaining weaknesses (these ARE worth fixing):**
+  1. **Defenders too dispersed to hold.** v5 has an army but the offense marches it AWAY to
+     enemy Bases, so each home Base is thinly held and breaks to coordinated Tank+Fighter+
+     Artillery swarms. Concentrate force; keep a real garrison floor home.
+  2. **Offense is strategically suspect for THIS game.** Win condition = "don't die"; kills
+     earn nothing. Marching out both under-defends home and (in self-play) makes the board
+     deadlier. A concentrated turtle likely beats a disperser. A/B it (see hunter-bot below).
+  3. **Post-200 Base spam still wasteful.** Bases founded t210+ mostly show "never completed"
+     (razed mid-build, 300g each wasted). The *peacetime* Bases are the good ones.
 
-2. **ZERO defenders — every single v3 loss ended with `units: {}`.** We now over-correct:
-   nearly all gold goes to Bases, none to a standing army, so each Base sits undefended and
-   a handful of Infantry (or 1–5 Artillery) walks in and razes it. We swung from v2's
-   "hoard gold, 2 Bases" to v3's "spam Bases, no army." Fix direction: **balance** — keep a
-   real garrison (Infantry + a few Artillery, which out-range Infantry on defense) AND keep
-   expanding; don't spend 100% on Bases. Verify: losses should end with a non-empty `units:`
-   and Bases that survive more than a few turns past completion.
+### Submission status
+- **Discord eval: WIN** (algo agent, 0/50 errored turns, 2026-06-10). NOTE: Discord runs only
+  **50 turns**, and our deaths all happen post-200 — so a Discord WIN mainly proves "runs clean
+  / no crash / no timeout vs real bots," NOT endgame survival. Still the safe locked-in baseline.
+- Opponents differ per stage (README): local `docker compose` = 19 **RandomAgents** (can't kill,
+  ~100% survival for anything); Discord = 19 **stronger algo bots**; real comp = other teams.
 
-Caveat on testing: self-play is a **confounded A/B** — changing our agent also changes all
-19 opponents, so survival % shifts for reasons unrelated to whether our change helped. The
-clean test is our new agent vs 19 copies of the OLD agent (git-worktree the old version,
-point `--opponent-agent` at it). Treat raw self-play deltas as suggestive, not proof.
+### How to improve from here (ranked by leverage)
+1. **Build a fixed "hunter" sparring bot** (single self-contained file like `algo_agent.py`, so
+   it doesn't collide with our agent's modules — see testing limit below). Scouts aggressively,
+   beelines for Bases, concentrates force. This is the #1 gap: it gives **unconfounded** signal
+   ("did survival vs the hunter go up?"), which self-play cannot. Unblocks all other tuning.
+2. **A/B turtle vs offense** against that hunter — settle whether v5's offensive doctrine helps
+   or hurts survival.
+3. **Stress-test the chat DoS (the likely "surprise").** We sanitize (`chat.py` caps msgs/len,
+   planners never read chat text), but VERIFY it: feed `decide()` an obs with ~10k oversized
+   chat messages and measure the time. Flat = defense holds; spikes = a real hole to plug.
+4. **Harden timing** — see below.
 
-### ⏱ decide() time is creeping — needs a Docker check
-Slowest `decide()`: v1 ~0.8s → v2 ~1.3s → **v3 ~1.9s** in 300-turn self-play (managing
-16–26 Bases costs per-turn loops). Still under 10s in-process, BUT the arena runs on a fast
-laptop core with no cap — under Docker's real **1-CPU / 1 GiB** limit this can be 2–3× higher,
-i.e. 4–6s, approaching the wall. **Confirm with `docker compose up --build`** (the only test
-that enforces the real deadline) before trusting that v3 is submission-safe. If it's tight,
-budget-cap the Base-management loops the way A* is already rationed in `military.py`.
+### ⏱ decide() time is creeping — Docker check is now overdue
+Slowest `decide()`: v1 ~0.8s → v2 ~1.3s → v3 ~1.9s → **v5 ~2.25s** in 300-turn self-play (more
+buildings + a big army = heavier per-turn loops). Under 10s in-process, BUT the arena runs on a
+fast laptop core with **no cap** — under Docker's real **1-CPU / 1 GiB** limit this can be 2–3×
+higher (~5–6s), approaching the wall. A timeout = no-op turn = a free death. **Confirm with
+`docker compose up --build`** (the only test that enforces the real deadline) before trusting v5
+is submission-safe. If tight, budget-cap the Base/unit loops the way A* is rationed in `military.py`.
+
+### ⚠️ Testing limit: you CANNOT cleanly A/B two versions of our agent in the arena
+Our agent is multi-file (`agent.py` imports `economy`/`military`/`state`/…). Python caches modules
+by name in `sys.modules`, so loading a *second* multi-file agent in the same arena process reuses
+the FIRST one's `economy`/`military` — a "v5 vs 19×v3" game actually runs v5 vs ~v5. So:
+- Version A/B via `--opponent-agent participant/src/agent.py` against an OLD checkout does **not**
+  isolate the change. The only clean isolation is **each version in its own process vs a fixed,
+  single-file opponent** (the hunter bot or `algo_agent.py`).
+- This is also why the real verdict comes from **Discord / the real competition**, not self-play.
