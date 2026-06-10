@@ -21,7 +21,9 @@ import logging
 import os
 import sys
 
-from fastapi import FastAPI
+import asyncio
+
+from fastapi import FastAPI, Request
 
 from agent_base import PlayerAgent
 from engine.actions import payload_to_dict
@@ -98,10 +100,19 @@ def make_agent() -> PlayerAgent:
         from llm_agent import LLMAgent  # needs OPENROUTER_API_KEY
 
         return LLMAgent()
-    # default: deterministic, no API key required
-    from algo_agent import AlgoAgent
+    # default: our deterministic agent; fall back to the template baseline if it
+    # ever fails to import (a running baseline beats a dead server)
+    try:
+        from agent import MainAgent
 
-    return AlgoAgent()
+        return MainAgent()
+    except Exception:
+        logging.getLogger("player").exception(
+            "MainAgent import failed — falling back to AlgoAgent"
+        )
+        from algo_agent import AlgoAgent
+
+        return AlgoAgent()
 
 
 _agent = make_agent()
@@ -115,11 +126,40 @@ def health() -> dict:
     return {"status": "ok", "agent": type(_agent).__name__}
 
 
+# Flood defense: chat in the observation is uncapped, so a hostile player can
+# inflate our request body to blow the 10s deadline or the 1 GiB RAM cap. An
+# oversized body gets an instant no-op (one lost turn) instead of an OOM-killed
+# container (every remaining turn lost). Identity fields are remembered from the
+# last good turn so the no-op payload still parses upstream.
+MAX_BODY_BYTES = 30 * 1024 * 1024
+DECIDE_TIMEOUT = 8.5  # backstop for accidental hangs; planners self-limit sooner
+
+_last_pid = "unknown"
+_last_turn = 0
+
+
 @app.post("/observe")
-async def observe(observation: dict) -> dict:
-    turn = observation.get("turn_number", 0)
+async def observe(request: Request) -> dict:
+    global _last_pid, _last_turn
+
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+        log.warning("oversized observation (%s bytes) -> no-op turn", length)
+        return {"player_id": _last_pid, "turn_number": _last_turn + 1, "actions": []}
+
     try:
-        out = payload_to_dict(await _agent.decide(observation))
+        observation = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body must not crash the server
+        log.exception("unparseable observation -> no-op turn")
+        return {"player_id": _last_pid, "turn_number": _last_turn + 1, "actions": []}
+
+    turn = observation.get("turn_number", 0)
+    _last_pid = observation.get("player_id", _last_pid)
+    _last_turn = turn
+    try:
+        out = payload_to_dict(
+            await asyncio.wait_for(_agent.decide(observation), timeout=DECIDE_TIMEOUT)
+        )
         log.info("turn %s -> %d actions", turn, len(out.get("actions", [])))
         log.debug("turn %s payload: %s", turn, out)  # full payload only at LOG_LEVEL=DEBUG
     except Exception:  # noqa: BLE001 — never crash the turn loop
