@@ -56,7 +56,7 @@ def plan(
         _plan_base(snap, mem, ledger, claimed, actions, short)
 
     _plan_barracks(snap, mem, ledger, claimed, actions, late)
-    _plan_scouts(snap, mem, ledger, claimed, actions, short)
+    _plan_scouts(snap, mem, ledger, claimed, actions, short, late, saving_for_base)
     _plan_mines(snap, mem, ledger, claimed, actions, short)
     _plan_infantry(snap, mem, ledger, claimed, actions, short, late)
     if not short and time.monotonic() < deadline:
@@ -68,35 +68,91 @@ def plan(
 
 
 def _plan_base(snap, mem, ledger, claimed, actions, short) -> None:
-    site = _ensure_base_site(snap, mem, short)
-    # a "hidden" Base 5 tiles from a besieged main base is just a second target:
-    # hold out for a genuinely distant site while there's still time to scout one
-    site_deadline = 10 if short else 30
-    if (
-        not short
-        and site is not None
-        and mem.base_site_threat < 8
-        and snap.turn < site_deadline
-    ):
-        return  # keep scouting for a quieter spot
-    if (
-        site is not None
-        and site in snap.visible
-        and site not in snap.occupied
-        and site not in claimed
-        and ledger.can(BASE_COST, force=True)
-    ):
-        ledger.spend(BASE_COST, force=True)
-        ledger.release(BASE_COST)
-        actions.append(
-            ConstructBuildingAction(building_type="Base", coord=HexCoord(*site))
-        )
-        mem.pending_builds[site] = {"type": "Base", "turn": snap.turn}
-        claimed.add(site)
-        mem.base_site_target = None
-        # the build is validated AFTER movement — keep our scouts (the likely
-        # vision source) parked this turn so the tile stays visible
-        mem.freeze_scouts_turn = snap.turn
+    if not ledger.can(BASE_COST, force=True):
+        _ensure_base_site(snap, mem, short)  # keep steering the Scout while saving
+        return
+
+    # Founding is OPPORTUNISTIC: any tile visible RIGHT NOW that clears the
+    # quality bar gets the Base. Waiting on one designated far site was the
+    # bottleneck (gold piled up while the Scout walked / the site churned, and
+    # on crowded maps no site ever passed the old hard threat gate). The
+    # designated site remains only as the Scout's steering target.
+    site = _best_visible_site(snap, mem, claimed, short)
+    if site is None:
+        target = _ensure_base_site(snap, mem, short)
+        if (
+            target is not None
+            and target in snap.visible
+            and target not in snap.occupied
+            and target not in claimed
+        ):
+            site = target
+    if site is None:
+        return
+    ledger.spend(BASE_COST, force=True)
+    ledger.release(BASE_COST)
+    actions.append(
+        ConstructBuildingAction(building_type="Base", coord=HexCoord(*site))
+    )
+    mem.pending_builds[site] = {"type": "Base", "turn": snap.turn}
+    claimed.add(site)
+    mem.base_site_target = None
+    # the build is validated AFTER movement — keep our scouts (the likely
+    # vision source) parked this turn so the tile stays visible
+    mem.freeze_scouts_turn = snap.turn
+
+
+def _required_threat_dist(snap, short) -> int:
+    """Minimum distance from known threats for a new Base site. Starts strict,
+    relaxes with time: holding out for a perfect site cost us games where NO
+    second Base was ever built — a risky Base beats none."""
+    if short:
+        return 3
+    if snap.turn < 25:
+        return 8
+    if snap.turn < 60:
+        return 6
+    return 4
+
+
+def _best_visible_site(snap, mem, claimed, short) -> Coord | None:
+    grid = snap.grid
+    threats = [HexCoord(*i["coord"]) for i in mem.known_enemy_bases.values()]
+    threats += [
+        HexCoord(*i["coord"])
+        for i in mem.last_seen_enemy.values()
+        if snap.turn - i["turn"] <= 15
+    ]
+    threats = threats[:25]  # cap the distance loop — this runs over all visible tiles
+    required = _required_threat_dist(snap, short)
+    own = [
+        HexCoord(b["q"], b["r"])
+        for b in snap.my_bases_done + snap.my_bases_building
+    ]
+    min_spread = 2 if short else 4  # clustered spares die to the same army
+
+    best, best_score = None, -1e9
+    for c in snap.visible:
+        if (
+            c in snap.occupied
+            or c in claimed
+            or c in mem.rich_tiles
+            or c in mem.pending_builds
+        ):
+            continue
+        hc = HexCoord(*c)
+        d_own = min((grid.distance(hc, b) for b in own), default=99)
+        if d_own < min_spread:
+            continue
+        d_threat = min((grid.distance(hc, t) for t in threats), default=30)
+        if d_threat < required:
+            continue
+        score = min(d_threat, 18) * 3.0 + min(d_own, 12) * 0.5
+        if mem.terrain_map.get(c) == "difficult":
+            score -= 1.0
+        if score > best_score:
+            best, best_score = c, score
+    return best
 
 
 def _ensure_base_site(snap, mem, short) -> Coord | None:
@@ -106,8 +162,11 @@ def _ensure_base_site(snap, mem, short) -> Coord | None:
     # or it's been stale for ages.
     site = mem.base_site_target
     if site is not None:
-        threatened = any(
-            snap.grid.distance(HexCoord(*site), HexCoord(*i["coord"])) <= 6
+        # threat-invalidation only EARLY: on a crowded map every site is near
+        # someone eventually, and perpetual re-picking meant no Base ever got
+        # built. Past turn 30 only an occupied tile invalidates the site.
+        threatened = snap.turn < 30 and any(
+            snap.grid.distance(HexCoord(*site), HexCoord(*i["coord"])) <= 4
             for i in mem.fresh_threats(snap)
         )
         stale = snap.turn - mem.base_site_turn > 30
@@ -307,10 +366,19 @@ def _adjacent_build_site(snap, mem, claimed) -> Coord | None:
 # ── units ─────────────────────────────────────────────────────────────────────
 
 
-def _plan_scouts(snap, mem, ledger, claimed, actions, short) -> None:
+def _plan_scouts(snap, mem, ledger, claimed, actions, short, late, saving) -> None:
     alive = sum(1 for u in snap.my_units if u["type"] == "Scout")
     pending = mem.pending_unit_count("Scout")
-    target = 1 if short or snap.turn > 0.5 * snap.max_turns else 2
+    # base count is gated by VISION, not gold: a Base needs a visible tile, so
+    # more Scouts = more sites surveyed in parallel = more spare Bases
+    if short:
+        target = 1
+    elif late:
+        target = 4
+    elif saving and snap.turn > 20:
+        target = 3
+    else:
+        target = 2
     if alive + pending >= target:
         return
     cost = UNIT_STATS["Scout"].gold_cost

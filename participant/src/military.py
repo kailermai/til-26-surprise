@@ -42,14 +42,26 @@ def plan(
         e for e in snap.enemy_buildings if snap.hostile(e["owner_id"])
     ]
 
+    # shared per-turn movement context: the terrain-cost dict is built ONCE
+    # (rebuilding it per unit was a hidden decide()-time cost), and A* calls are
+    # budgeted — units beyond the budget fall back to greedy steps. Scouts go
+    # first in priority order, so spend on combat moves after scouts' share.
+    ctx = _MoveCtx(costs=_move_costs(mem), astar_left=12)
+
     attackers_used = _plan_attacks(snap, mem, actions, combat, hostile_all)
     if time.monotonic() < deadline:
-        _plan_combat_moves(
-            snap, mem, actions, combat, hostiles, attackers_used, claimed, deadline
-        )
+        _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline, ctx)
     if time.monotonic() < deadline:
-        _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline)
+        _plan_combat_moves(
+            snap, mem, actions, combat, hostiles, attackers_used, claimed, deadline, ctx
+        )
     return actions
+
+
+class _MoveCtx:
+    def __init__(self, costs: dict, astar_left: int) -> None:
+        self.costs = costs
+        self.astar_left = astar_left
 
 
 # ── attacks ───────────────────────────────────────────────────────────────────
@@ -140,7 +152,7 @@ def _consolidate_turn(snap: Snapshot) -> int:
 
 
 def _plan_combat_moves(
-    snap, mem, actions, combat, hostiles, attackers_used, claimed, deadline
+    snap, mem, actions, combat, hostiles, attackers_used, claimed, deadline, ctx
 ) -> None:
     grid = snap.grid
     bases = snap.my_bases_done + snap.my_bases_building
@@ -197,7 +209,7 @@ def _plan_combat_moves(
         if base_overwhelmed[bi] and safest != bi:
             sc = HexCoord(bases[safest]["q"], bases[safest]["r"])
             if grid.distance(here, sc) > 2:
-                _advance(snap, mem, u, sc, claimed, actions)
+                _advance(snap, mem, u, sc, claimed, actions, ctx)
             continue
 
         # threats near MY assigned base → intercept the closest one
@@ -213,20 +225,20 @@ def _plan_combat_moves(
             )
             goal = HexCoord(tgt["q"], tgt["r"])
             if grid.distance(here, goal) > 1:
-                _advance(snap, mem, u, goal, claimed, actions)
+                _advance(snap, mem, u, goal, claimed, actions, ctx)
             continue
 
         # peacetime / endgame posture: stay within the garrison ring
         ring = 2 if not endgame else 1
         if d_home > ring:
-            _advance(snap, mem, u, bc, claimed, actions)
+            _advance(snap, mem, u, bc, claimed, actions, ctx)
         # else: hold (engine default, no action needed)
 
 
 # ── scouts ────────────────────────────────────────────────────────────────────
 
 
-def _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline) -> None:
+def _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline, ctx) -> None:
     if not scouts or mem.freeze_scouts_turn == snap.turn:
         return  # a Base build resolves after movement — keep eyes parked
     grid = snap.grid
@@ -243,7 +255,7 @@ def _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline) -> None:
             site = HexCoord(*mem.base_site_target)
             d = grid.distance(here, site)
             if d > 2:
-                _advance(snap, mem, u, site, claimed, actions, stop_short=2)
+                _advance(snap, mem, u, site, claimed, actions, ctx, stop_short=2)
             # within 2: hold — the site is inside our 5-tile vision even with
             # concealment, economy will fire the build when it can
             continue
@@ -254,7 +266,7 @@ def _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline) -> None:
             bc = HexCoord(b["q"], b["r"])
             if grid.distance(here, bc) <= 6:
                 if grid.distance(here, bc) > 2:
-                    _advance(snap, mem, u, bc, claimed, actions, stop_short=2)
+                    _advance(snap, mem, u, bc, claimed, actions, ctx, stop_short=2)
                 guarding = True
                 break
         if guarding:
@@ -267,7 +279,7 @@ def _plan_scout_moves(snap, mem, actions, scouts, claimed, deadline) -> None:
             if goal is None:
                 continue
             mem.scout_goals[u["id"]] = goal
-        _advance(snap, mem, u, HexCoord(*goal), claimed, actions)
+        _advance(snap, mem, u, HexCoord(*goal), claimed, actions, ctx)
 
 
 def _pick_frontier(snap: Snapshot, mem: Memory, here: HexCoord) -> Coord | None:
@@ -298,17 +310,24 @@ def _move_costs(mem: Memory) -> dict[HexCoord, int]:
     }
 
 
-def _advance(snap, mem, unit, goal, claimed, actions, stop_short: int = 0) -> None:
+def _advance(snap, mem, unit, goal, claimed, actions, ctx, stop_short: int = 0) -> None:
     """Path toward `goal`, taking as many steps as the unit's movement budget
-    allows. Never enters a tile occupied at turn start or already claimed."""
+    allows. Never enters a tile occupied at turn start or already claimed.
+    A* is rationed via ctx (it's the decide()-time hot spot with a big army);
+    over-budget units take greedy steps instead."""
     grid = snap.grid
     here = HexCoord(unit["q"], unit["r"])
     move_range = unit.get("movement_range", 1)
-    blocked = {HexCoord(*c) for c in snap.occupied | claimed}
-    blocked.discard(here)
-    blocked.discard(goal)  # let A* route; we trim the path before the goal tile
 
-    path = grid.shortest_path(here, goal, movement_cost_fn=_move_costs(mem), blocked=blocked)
+    path = None
+    if ctx.astar_left > 0:
+        ctx.astar_left -= 1
+        blocked = {HexCoord(*c) for c in snap.occupied | claimed}
+        blocked.discard(here)
+        blocked.discard(goal)  # let A* route; we trim the path before the goal tile
+        path = grid.shortest_path(
+            here, goal, movement_cost_fn=ctx.costs, blocked=blocked
+        )
     steps: list[HexCoord] = [here]
     if path and len(path) > 1:
         budget = move_range
