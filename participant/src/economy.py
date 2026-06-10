@@ -33,11 +33,7 @@ def plan(
     # dump it into redundancy (spare Bases, Barracks, units)
     late = not short and snap.turn >= TREATY_CUTOFF_TURN - 20
 
-    base_intent = (
-        len(snap.my_bases_done)
-        + len(snap.my_bases_building)
-        + mem.pending_build_count("Base")
-    )
+    base_intent = len(_intent_sites(snap, mem, "Base"))
     if short:
         target_bases = 2
     elif late:
@@ -222,12 +218,23 @@ def claimed_safe(mem) -> set[Coord]:
     return set(mem.pending_builds)
 
 
+def _intent_sites(snap, mem, building_type: str) -> set[Coord]:
+    """Every tile where a `building_type` of ours stands or is on the way:
+    visible buildings (complete or under construction) UNION pending builds.
+    The union dedupes — a pending entry now outlives its building's first
+    sighting (it is only cleared on COMPLETION), so coords can appear in both."""
+    sites = {
+        (b["q"], b["r"]) for b in snap.my_buildings if b["type"] == building_type
+    }
+    sites |= {c for c, i in mem.pending_builds.items() if i["type"] == building_type}
+    return sites
+
+
 # ── support buildings ─────────────────────────────────────────────────────────
 
 
 def _plan_barracks(snap, mem, ledger, claimed, actions, late=False) -> None:
-    count = sum(1 for b in snap.my_buildings if b["type"] == "Barracks")
-    count += mem.pending_build_count("Barracks")
+    count = len(_intent_sites(snap, mem, "Barracks"))
     # late game: more Barracks = more Infantry per turn out of the gold pile
     target = 3 if late and ledger.gold >= 1000 else 1
     if count >= target:
@@ -248,8 +255,7 @@ def _plan_barracks(snap, mem, ledger, claimed, actions, late=False) -> None:
 
 
 def _plan_mines(snap, mem, ledger, claimed, actions, short) -> None:
-    mines = sum(1 for b in snap.my_buildings if b["type"] == "Mine")
-    mines += mem.pending_build_count("Mine")
+    mines = len(_intent_sites(snap, mem, "Mine"))
     cost = BUILDING_STATS["Mine"].gold_cost
 
     first = mines == 0

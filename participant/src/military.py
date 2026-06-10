@@ -377,10 +377,18 @@ def _step_away(snap, unit, hostiles, claimed) -> HexCoord | None:
         hostiles, key=lambda h: grid.distance(here, HexCoord(h["q"], h["r"]))
     )
     nc = HexCoord(nearest["q"], nearest["r"])
+    move_range = unit.get("movement_range", 1)
     best, best_d = None, grid.distance(here, nc)
     for n in grid.neighbors(here):
         c = (n.q, n.r)
         if c in snap.occupied or c in claimed:
+            continue
+        # an unaffordable difficult step makes the engine drop the WHOLE move —
+        # the "retreating" unit would just stand still in attack range
+        if (
+            snap.terrain.get(c) == "difficult"
+            and move_range < DIFFICULT_TERRAIN_MOVE_COST
+        ):
             continue
         d = grid.distance(n, nc)
         if d > best_d:

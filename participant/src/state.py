@@ -256,12 +256,25 @@ class Memory:
             for e in snap.my_units + snap.my_buildings
         }
 
-        # our pending builds: success (our building stands there) or visible
-        # failure / timeout clears the entry
+        # our pending builds: an entry lives until the building is seen COMPLETE.
+        # Under-construction buildings cast no vision, so a planted Base can drop
+        # out of the obs entirely mid-build — forgetting it early double-spends.
+        # A visibly empty/foreign tile means the build failed (or died): clear it
+        # so we retry; the type-aware timeout is the safety net for fog.
         mine_at: set[Coord] = {(b["q"], b["r"]) for b in snap.my_buildings}
+        done_at: set[Coord] = {
+            (b["q"], b["r"])
+            for b in snap.my_buildings
+            if b.get("is_complete", True)
+        }
         for c in list(self.pending_builds):
             info = self.pending_builds[c]
-            if c in mine_at or snap.turn - info["turn"] >= 3:
+            failed = snap.turn > info["turn"] and c in snap.visible and c not in mine_at
+            expired = (
+                snap.turn - info["turn"]
+                >= BUILDING_STATS[info["type"]].build_turns + 2
+            )
+            if c in done_at or failed or expired:
                 del self.pending_builds[c]
 
         # pending production: drop entries past their due turn
