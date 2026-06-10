@@ -293,13 +293,56 @@ enough to share the garrison (delay far Bases until a defensive core exists).
   robustness, never hunter-specific counters (don't tune to its exact wave size). Respect the
   hunter FREEZE RULE — if you need a tougher benchmark, add `hunter_bot_v2.py`, keep old numbers comparable.
 
-### Other improvements (ranked, lower priority than the early floor)
-1. **A/B turtle vs offense** against the hunter — settle whether v5/v6's offensive doctrine helps
-   or hurts survival now that defense is concentrated.
-2. **Stress-test the chat DoS (the likely "surprise").** We sanitize (`chat.py` caps msgs/len,
-   planners never read chat text), but VERIFY it: feed `decide()` an obs with ~10k oversized
-   chat messages and measure the time. Flat = defense holds; spikes = a real hole to plug.
-3. **Harden timing** — see below.
+### v8 result — confirms the early death is an ECONOMY problem, not a military one
+v8 added counter-aggression to `military.py` (shoot-on-sight at aggressors, kill besiegers at the
+wall, counter-raid the rusher's Base — "the moat strategy"). **v8 vs hunter = 7/14, IDENTICAL to
+v6.** Early deaths unchanged (seed 4 still dies turn 30 with 1 Infantry + 1 Scout — verify:
+`python tools/postmortem.py replays/arena/seed_4.jsonl`). BUT outright wins rose 1→3/14 and
+survivors-beside-us fell 2.6→1.9 — the counter-raid genuinely works *in games that reach
+mid-game*, it just can't fire at turn 30 (its `len(combat) > 8` gate can't be met with 1–2 units).
+**Conclusion: two military-only versions (v6, v8) left the turn-30 deaths byte-identical. You
+cannot fix a Base defended by 1 Infantry with targeting logic — the fix is the early-defense floor
+in `economy.py`. The counter-raid then COMPOUNDS with it (survive the rush → have an army →
+eliminate the rusher → permanent relief).**
+
+## 📋 Prioritized roadmap (VERIFY each — re-run the commands, don't take on faith)
+
+### Tier 1 — confirmed holes / existential, cheap to check
+1. **Early-defense floor (`economy.py`) — THE #1 fix.** See "🛠 #1 recommended upgrade" above.
+   Confirmed weakness (turn-30 death, half our hunter losses), unaddressed, and proven NOT
+   fixable in `military.py`. Verify after: hunter losses should stop clustering at t30–50, and
+   `units:` at death should be non-empty. Guard against self-play regression.
+2. **Stress-test the chat DoS (likely "the surprise") — existential, UNVERIFIED.** We *believe*
+   `chat.py` caps protect us, but never tested it. Feed `decide()` an obs with ~10k oversized
+   messages and time it. Flat = immune to the #1 asymmetric weapon; a spike = the most important
+   fix on the board (one opponent could timeout us to death).
+3. **Docker timing check — existential, UNVERIFIED.** decide() climbed 0.8→2.25s across versions;
+   under the real 1-CPU cap (+ a possible chat flood) it could near the 10s wall. Only
+   `docker compose up --build` tests this. A timeout = a free death every turn.
+
+### Tier 2 — real strategy improvements
+4. **Hidden-base QUALITY, not just count.** "Far" ≠ "hidden" vs smart scouts. Put spares on
+   **concealment terrain** (Scouts inside are invisible), spread across the torus, and don't
+   telegraph (don't march units toward them). Core survival lever, under-optimized.
+5. **A/B offense vs concentrated turtle.** v8's counter-raid wins 3/14 outright but offense
+   disperses defenders. Now defense is concentrated (v6 KEEPS/RING) — is offense net-positive for
+   *survival* (kills earn nothing)? Toggle the counter-raid off, compare vs hunter.
+6. **A 2nd opponent archetype — `hunter_bot_v2.py` (FREEZE the original).** We've tuned vs turtle
+   (self-play) + ground-rush (hunter). The real field has more: **air-rush** especially (Bombers do
+   ×4 vs buildings and FLY over the Infantry ring — does our defense handle air AT ALL?), artillery
+   siege, economic boom. An air-rush bot would expose a likely blind spot.
+
+### Tier 3 — infrastructure / polish
+7. **Clean version A/B** — run each version in its own subprocess vs a fixed single-file opponent,
+   to sidestep the module-collision limit (below) and finally answer "is vN better than vN-1?"
+8. **Bigger sweeps (50–100 games)** for final confidence — 14-game CIs are ±~20 pts, too noisy for
+   small gains. Parallel runner makes this a few minutes.
+9. **LLM v2** — consume `_stances` as DEFENSE-ONLY hints (raise garrison priority near a "hostile"
+   player's likely approach). Never let it trigger attacks/treaty-breaks (that hands injection a
+   lever). Last 5%; only after Tier 1–2.
+
+**Suggested order for limited time: 1 → 2 → 3.** Fix the biggest survival hole, then verify the two
+existential assumptions (chat DoS, timing) we're currently only *hoping* are true.
 
 ### ⏱ decide() time is creeping — Docker check is now overdue
 Slowest `decide()`: v1 ~0.8s → v2 ~1.3s → v3 ~1.9s → **v5 ~2.25s** in 300-turn self-play (more
@@ -308,6 +351,38 @@ fast laptop core with **no cap** — under Docker's real **1-CPU / 1 GiB** limit
 higher (~5–6s), approaching the wall. A timeout = no-op turn = a free death. **Confirm with
 `docker compose up --build`** (the only test that enforces the real deadline) before trusting v5
 is submission-safe. If tight, budget-cap the Base/unit loops the way A* is rationed in `military.py`.
+
+### 🤖 LLM layer (`AGENT=llm`) — chat/diplomacy ONLY, off by default
+One image, one `MainAgent`. The LLM is a bolt-on inside `agent.py` (`self._llm`), built ONLY when
+`AGENT=llm` AND a key is present — so `AGENT=algo` (the submitted default) and the arena are
+byte-identical to pure algo. Full design + handoff in `LLM_LAYER_PLAN.md`; code in
+`participant/src/llm_layer.py`; offline tests `tools/test_llm_layer.py` (all passing). It runs the
+model OFF the critical path (background asyncio task, harvested a turn later — zero added latency)
+and the ONLY action it can emit is a short DM to a known non-aggressor. **Still TODO: the live
+`AGENT=llm OPENROUTER_API_KEY=… docker compose up` check** — until that passes, submit `algo`.
+
+The LLM does **nothing** for the turn-30 hunter death (that's military, in the algo path). It is a
+safe bonus, not a survival fix. Keep `algo` as the banked submission; only ship `llm` if the live
+Docker check is clean and the key is baked in.
+
+### 🛡 Why the LLM layer is injection-proof (it doesn't win the arms race — it sidesteps it)
+Prompt-injection filters are an unwinnable arms race (instruction-following, `p a s s w o r d`
+spacing, story-wrapping, translation, `print(os.getenv("KEY"))` format tricks — all eventually
+bypass any filter). Our layer assumes the model **will** get jailbroken and makes that harmless via
+TWO structural defenses, not prompt cleverness:
+1. **No secrets in the prompt.** The model never sees coordinates, gold, unit counts, or plans —
+   only turn + player IDs + untrusted chat. The entire "make it reveal X" attack class (which is ALL
+   the Gandalf-style techniques) is moot: there is no X to reveal. The `os.getenv` trick also fails —
+   the model runs on OpenRouter's servers with NO access to our container env; it can only hallucinate
+   a fake key, and our real key is never in the prompt.
+2. **Capability confinement.** Model output can ONLY become a `SendChatAction` (DM, ≤240 chars, to a
+   known player who isn't an aggressor). There is NO code path to move/attack/build/treaty. A fully
+   jailbroken model cannot make us attack an ally, break a treaty, stop defending, or time out (it's a
+   background task, 40 calls/game cap + circuit breaker).
+- **Residual (accepted):** worst case = ≤2 weird/rude DMs of ≤240 chars to players we already know.
+  Reveals nothing, binds us to nothing, can't affect survival.
+- This is the RIGHT model for "injection is likely the surprise": don't bet the model won't be
+  tricked — make being tricked do nothing.
 
 ### ⚠️ Testing limit: you CANNOT cleanly A/B two versions of our agent in the arena
 Our agent is multi-file (`agent.py` imports `economy`/`military`/`state`/…). Python caches modules

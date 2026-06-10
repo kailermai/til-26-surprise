@@ -25,6 +25,11 @@ SHORT_GAME_TURNS = 60  # at/below this max_turns, play the compressed build orde
 WAR_PREP_TURN = TREATY_CUTOFF_TURN - 60
 OVERFLOW_GOLD = 1000
 BIG_OVERFLOW_GOLD = 3000
+# Early-defense floor: a turn-30 rush kills a Base defended by 1–2 Infantry
+# (confirmed vs hunter_bot — see CLAUDE.md). Stand up a minimum garrison BEFORE
+# saving gold for hidden Bases; naked expansion just hands a rusher a free kill.
+EARLY_DEFENSE_FLOOR = 5  # Infantry to have standing/pending before saving for a Base
+EARLY_DEFENSE_BY_TURN = 80  # enforce the floor through the early game
 
 
 def plan(
@@ -46,6 +51,19 @@ def plan(
     if not short and time.monotonic() < deadline:
         _plan_airbase(snap, mem, ledger, claimed, actions, war_prep, late, overflow)
 
+    # EARLY DEFENSE FLOOR: until a minimum garrison stands, defense outranks
+    # expansion. A hidden Base founded while home has 1 Infantry is worthless —
+    # the rush kills the main Base before the spare matters.
+    defenders = (
+        sum(1 for u in snap.my_units if u["type"] == "Infantry")
+        + mem.pending_unit_count("Infantry")
+    )
+    need_defense = (
+        not short
+        and snap.turn <= EARLY_DEFENSE_BY_TURN
+        and defenders < EARLY_DEFENSE_FLOOR
+    )
+
     production_ready = _production_ready(snap, mem, war_prep, late)
     base_intent = len(_intent_sites(snap, mem, "Base"))
     target_bases = _target_base_count(
@@ -55,13 +73,21 @@ def plan(
     if snap.turn > snap.max_turns - BUILDING_STATS["Base"].build_turns - 3:
         target_bases = 0
 
-    saving_for_base = base_intent < target_bases and len(snap.my_bases_done) >= 1
+    # don't reserve gold for a hidden Base while the home garrison is below the
+    # floor — that reservation is exactly what starved early Infantry (turn-30 death)
+    saving_for_base = (
+        base_intent < target_bases
+        and len(snap.my_bases_done) >= 1
+        and not need_defense
+    )
     if saving_for_base:
         ledger.reserve(BASE_COST)
         _plan_base(snap, mem, ledger, claimed, actions, short)
 
     _plan_scouts(snap, mem, ledger, claimed, actions, short, late, saving_for_base)
-    _plan_infantry(snap, mem, ledger, claimed, actions, short, war_prep, late, overflow)
+    _plan_infantry(
+        snap, mem, ledger, claimed, actions, short, war_prep, late, overflow, need_defense
+    )
     if not short and time.monotonic() < deadline:
         _plan_heavy_units(snap, mem, ledger, claimed, actions, war_prep, late, overflow)
     if not short and time.monotonic() < deadline:
@@ -506,7 +532,8 @@ def _plan_scouts(snap, mem, ledger, claimed, actions, short, late, saving) -> No
 
 
 def _plan_infantry(
-    snap, mem, ledger, claimed, actions, short, war_prep=False, late=False, overflow=False
+    snap, mem, ledger, claimed, actions, short, war_prep=False, late=False,
+    overflow=False, need_defense=False,
 ) -> None:
     alive = sum(1 for u in snap.my_units if u["type"] == "Infantry")
     pending = mem.pending_unit_count("Infantry")
@@ -521,14 +548,19 @@ def _plan_infantry(
         target = min(12, 3 * n_bases + 2)
     else:
         target = min(8, 2 * n_bases + 2)
-    per_turn_cap = 30 if late or overflow else (10 if war_prep else 3)
+    if need_defense:
+        target = max(target, EARLY_DEFENSE_FLOOR)  # never below the garrison floor
+    force = overflow or late or need_defense
+    per_turn_cap = 30 if late or overflow else (10 if war_prep else (4 if need_defense else 3))
     cost = UNIT_STATS["Infantry"].gold_cost
     made = 0
     for b in snap.my_buildings:
         if b["type"] != "Barracks" or not b.get("is_complete", True):
             continue
-        # don't trickle units into a hopeless siege — bank the gold for the
-        # next Base instead (units die one by one against a massed swarm)
+        # don't trickle units into a hopeless siege — bank the gold for the next
+        # Base instead (units die one by one against a massed swarm). EXCEPTION:
+        # while below the early-defense floor, NOT building is certain death —
+        # keep producing or the rush wins uncontested (the turn-30 loss mode).
         threat = mem.threat_near(snap, (b["q"], b["r"]), 5)
         ours = sum(
             u.get("attack_power", 0)
@@ -539,17 +571,17 @@ def _plan_infantry(
             )
             <= 5
         )
-        if not (late or overflow) and threat > 3 * (
+        if not (late or overflow or need_defense) and threat > 3 * (
             ours + UNIT_STATS["Infantry"].attack_power
         ):
             continue
         while (
             alive + pending + made < target
             and made < per_turn_cap
-            and ledger.can(cost, force=overflow or late)
+            and ledger.can(cost, force=force)
         ):
             if not _produce(
-                snap, mem, ledger, claimed, actions, b, "Infantry", force=overflow or late
+                snap, mem, ledger, claimed, actions, b, "Infantry", force=force
             ):
                 break
             made += 1
