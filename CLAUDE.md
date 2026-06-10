@@ -172,3 +172,55 @@ turn, and won-outright count. Saves a replay **only for games you lose**, under
   meta is "don't die," and why you need a real opponent to tell strong agents from lazy ones.
 - The arena does **not** enforce the 10s/turn deadline (it calls `decide()` directly).
   Keep `docker compose up` for that.
+
+## Loss analysis — `tools/postmortem.py`
+
+Explains *why* a replay was lost: every Base's lifecycle (where, founded/completed/
+destroyed turn, and **who** destroyed it from the action logs), plus what we held at
+death (gold, units, buildings) and how far apart the bases were.
+
+```bash
+python tools/postmortem.py replays/arena/seed_6.jsonl
+python tools/postmortem.py replays/arena/seed_6.jsonl --player player-3   # autopsy anyone
+```
+
+## ⚠️ Open investigation (2026-06-10) — VERIFY before trusting, do not take on faith
+
+These are findings from arena sweeps + post-mortems. **Re-run the commands and confirm
+the numbers yourself before acting** — they are a snapshot of one set of seeds, the
+agent code changes underneath this note, and small-n survival % has wide error bars.
+
+**The headline: our agent dies rich.** In every loss examined (v2, self-play, seeds 3/5/
+9/12/13/14), the agent was eliminated holding **~24k–28k unspent gold** with only 1–2
+Bases. All deaths land just after the **turn-200 treaty cutoff** (median ~220), i.e. the
+forced-open-war endgame. Reproduce:
+```bash
+python tools/arena_parallel.py --games 14 --opponent-agent participant/src/agent.py
+python tools/postmortem.py replays/arena/seed_3.jsonl   # then 5, 14, ...
+```
+
+**The real bottleneck is base COUNT, and base count is gated by SCOUT VISION, not gold.**
+A Base may only be founded on an empty tile *you currently see* — with 1–2 Scouts you can
+only survey one site at a time, so the agent founds 1–2 Bases a game **no matter how much
+gold it has**. The "spare hidden Base" is our single biggest survival lever (see strategy
+north star) and we are bottlenecked at ~2 of them. Hypothesis to test: **many more Scouts
+surveying many sites in parallel** is what unlocks gold→Bases, *not* raising the base-count
+target. Verify by checking `bases over the whole game` in post-mortems before/after.
+
+**A v2 change appears to have regressed base-founding (needs confirmation).** The
+`_plan_base` gate in `economy.py` that holds out for a site with `base_site_threat >= 8`
+made seed 3 refuse to commit to *any* nearby site and **never build a second Base** (died
+turn 209, one Base, 27.7k gold). On crowded maps every site is near someone. Check whether
+this gate is net-negative (compare base counts with it on vs off).
+
+**Self-play survival % is a CONFOUNDED A/B.** When `--opponent-agent` is our own agent,
+changing our agent also changes all 19 opponents, so the whole meta shifts and survival %
+moves for reasons unrelated to whether our change helped. The clean test is **our new
+agent vs 19 copies of the OLD agent** (opponents held fixed) — materialise the old version
+in a git worktree and point `--opponent-agent` at it. Treat raw self-play deltas as
+suggestive, not proof. Also: with n=14 the 95% CI spans ~±20 points — don't read a 50%
+vs 64% gap as real without more games.
+
+**Watch decide() time.** The v2 threat/power loops pushed slowest `decide()` from ~0.8s to
+~1.3s in 300-turn self-play. Still far under 10s, but the trend matters — confirm under
+`docker compose up`, the only real deadline check.
