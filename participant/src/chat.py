@@ -14,6 +14,30 @@ MAX_MESSAGES = 50  # keep only the newest N per channel
 MAX_TEXT_CHARS = 500  # truncate each message body
 
 
+def delta(obs: dict, after_turn: int) -> list[dict]:
+    """Messages newer than `after_turn` from both channels, excluding our own,
+    flattened to {turn, channel, sender, text} and sorted by turn. Pure read —
+    call it only on an obs that already went through sanitize()."""
+    pid = obs.get("player_id")
+    out: list[dict] = []
+    for key, channel in (("global_chat", "global"), ("private_chat", "dm")):
+        for m in obs.get(key, []):
+            t = m.get("turn")
+            if not isinstance(t, int) or t <= after_turn or m.get("sender_id") == pid:
+                continue
+            text = m.get("text")
+            out.append(
+                {
+                    "turn": t,
+                    "channel": channel,
+                    "sender": str(m.get("sender_id", "?")),
+                    "text": text if isinstance(text, str) else "",
+                }
+            )
+    out.sort(key=lambda m: m["turn"])
+    return out
+
+
 def sanitize(obs: dict) -> dict:
     for key in ("global_chat", "private_chat"):
         msgs = obs.get(key)

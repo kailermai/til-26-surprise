@@ -27,8 +27,19 @@ SOFT_BUDGET_SECONDS = 6.5  # leave headroom under the ~10s turn deadline
 
 
 class MainAgent(PlayerAgent):
-    def __init__(self) -> None:
+    def __init__(self, llm_enabled: bool = False) -> None:
         self.mem = state.Memory()
+        # optional LLM chat layer (AGENT=llm): off-critical-path, chat-only.
+        # Flag flows from server.py ONLY — the arena instantiates with no args,
+        # so self-play sweeps can never fan out into 20x API calls.
+        self._llm = None
+        if llm_enabled:
+            try:
+                from llm_layer import LLMLayer
+
+                self._llm = LLMLayer()
+            except Exception:
+                log.exception("LLM layer init failed — running pure algo")
 
     async def decide(self, observation: dict) -> ActionPayload:
         deadline = time.monotonic() + SOFT_BUDGET_SECONDS
@@ -40,7 +51,11 @@ class MainAgent(PlayerAgent):
             ledger = state.Ledger(snap.gold)
             claimed: set[state.Coord] = set()  # tiles reserved by planned actions
 
-            actions = diplomacy.plan(snap, self.mem)
+            # chat actions cost no gold and claim no tiles; step() is a plain
+            # call (harvest finished background LLM task + maybe spawn a new
+            # one) and adds no meaningful latency
+            actions = self._llm.step(obs, snap, self.mem) if self._llm else []
+            actions += diplomacy.plan(snap, self.mem)
             actions += economy.plan(snap, self.mem, ledger, claimed, deadline)
             if time.monotonic() < deadline:
                 actions += military.plan(snap, self.mem, ledger, claimed, deadline)
