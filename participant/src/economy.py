@@ -15,14 +15,13 @@ from __future__ import annotations
 import time
 
 from engine.actions import ConstructBuildingAction, ProduceUnitAction
-from engine.constants import BUILDING_STATS, UNIT_STATS
+from engine.constants import BUILDING_STATS, TREATY_CUTOFF_TURN, UNIT_STATS
 from engine.hex_grid import HexCoord
 
 from state import Coord, Ledger, Memory, Snapshot
 
 BASE_COST = BUILDING_STATS["Base"].gold_cost
 SHORT_GAME_TURNS = 60  # at/below this max_turns, play the compressed build order
-RESITE_EVERY = 6  # re-evaluate the hidden-Base site this often
 
 
 def plan(
@@ -30,6 +29,9 @@ def plan(
 ) -> list:
     actions: list = []
     short = snap.max_turns <= SHORT_GAME_TURNS
+    # from here the forced-war endgame is close: hoarded gold is worthless,
+    # dump it into redundancy (spare Bases, Barracks, units)
+    late = not short and snap.turn >= TREATY_CUTOFF_TURN - 20
 
     base_intent = (
         len(snap.my_bases_done)
@@ -38,6 +40,10 @@ def plan(
     )
     if short:
         target_bases = 2
+    elif late:
+        # keep founding spares as long as gold allows — every completed Base is
+        # another thing 19 hostile players must find and kill
+        target_bases = max(3, base_intent + (1 if ledger.gold >= 2 * BASE_COST else 0))
     else:
         target_bases = 2 if snap.turn < 0.25 * snap.max_turns else 3
     # stop founding bases too late to complete (they only count when finished)
@@ -49,12 +55,12 @@ def plan(
         ledger.reserve(BASE_COST)
         _plan_base(snap, mem, ledger, claimed, actions, short)
 
-    _plan_barracks(snap, mem, ledger, claimed, actions)
+    _plan_barracks(snap, mem, ledger, claimed, actions, late)
     _plan_scouts(snap, mem, ledger, claimed, actions, short)
     _plan_mines(snap, mem, ledger, claimed, actions, short)
-    _plan_infantry(snap, mem, ledger, claimed, actions, short)
+    _plan_infantry(snap, mem, ledger, claimed, actions, short, late)
     if not short and time.monotonic() < deadline:
-        _plan_factory(snap, mem, ledger, claimed, actions)
+        _plan_factory(snap, mem, ledger, claimed, actions, late)
     return actions
 
 
@@ -94,14 +100,25 @@ def _plan_base(snap, mem, ledger, claimed, actions, short) -> None:
 
 
 def _ensure_base_site(snap, mem, short) -> Coord | None:
+    # A chosen site is COMMITTED: a far site takes a Scout 10+ turns to walk to,
+    # so periodic re-picking guarantees only near (bad) sites ever get built.
+    # Re-pick only when the site is invalidated — occupied, a threat moved in,
+    # or it's been stale for ages.
     site = mem.base_site_target
-    needs_pick = (
-        site is None
-        or site in snap.occupied
-        or snap.turn - mem.base_site_turn >= RESITE_EVERY
-    )
-    if not needs_pick:
-        return site
+    if site is not None:
+        threatened = any(
+            snap.grid.distance(HexCoord(*site), HexCoord(*i["coord"])) <= 6
+            for i in mem.fresh_threats(snap)
+        )
+        stale = snap.turn - mem.base_site_turn > 30
+        if not (site in snap.occupied or threatened or stale):
+            return site
+        mem.base_site_target = None
+
+    # don't lock in a site while the map is still tiny — let the Scout push the
+    # frontier out first so far candidates exist at all
+    if not short and snap.turn < 10 and len(mem.explored) < 120:
+        return None
 
     main = snap.main_base()
     if main is None:
@@ -149,17 +166,21 @@ def claimed_safe(mem) -> set[Coord]:
 # ── support buildings ─────────────────────────────────────────────────────────
 
 
-def _plan_barracks(snap, mem, ledger, claimed, actions) -> None:
-    have = any(b["type"] == "Barracks" for b in snap.my_buildings)
-    if have or mem.pending_build_count("Barracks"):
+def _plan_barracks(snap, mem, ledger, claimed, actions, late=False) -> None:
+    count = sum(1 for b in snap.my_buildings if b["type"] == "Barracks")
+    count += mem.pending_build_count("Barracks")
+    # late game: more Barracks = more Infantry per turn out of the gold pile
+    target = 3 if late and ledger.gold >= 1000 else 1
+    if count >= target:
         return
     cost = BUILDING_STATS["Barracks"].gold_cost
-    if not ledger.can(cost, force=True):  # exempt: Barracks enables Scouts
+    force = count == 0  # the first Barracks enables Scouts — exempt from reserve
+    if not ledger.can(cost, force=force):
         return
     site = _adjacent_build_site(snap, mem, claimed)
     if site is None:
         return
-    ledger.spend(cost, force=True)
+    ledger.spend(cost, force=force)
     actions.append(
         ConstructBuildingAction(building_type="Barracks", coord=HexCoord(*site))
     )
@@ -224,8 +245,8 @@ def _plan_mines(snap, mem, ledger, claimed, actions, short) -> None:
     claimed.add(site)
 
 
-def _plan_factory(snap, mem, ledger, claimed, actions) -> None:
-    if snap.turn < 50 or len(snap.my_bases_done) < 2:
+def _plan_factory(snap, mem, ledger, claimed, actions, late=False) -> None:
+    if snap.turn < 40 or len(snap.my_bases_done) < 2:
         return
     have_factory = any(b["type"] == "Factory" for b in snap.my_buildings)
     if not have_factory and not mem.pending_build_count("Factory"):
@@ -242,10 +263,11 @@ def _plan_factory(snap, mem, ledger, claimed, actions) -> None:
                 mem.pending_builds[site] = {"type": "Factory", "turn": snap.turn}
                 claimed.add(site)
         return
-    # one or two Artillery: range 3 outranges every ground unit on defense
+    # Artillery (range 3) is what kills bases — and what defends them. Keep a
+    # couple in peacetime, more once the forced war is near.
     art = sum(1 for u in snap.my_units if u["type"] == "Artillery")
     art += mem.pending_unit_count("Artillery")
-    if art >= 2:
+    if art >= (6 if late else 2):
         return
     cost = UNIT_STATS["Artillery"].gold_cost
     for b in snap.my_buildings:
@@ -300,16 +322,21 @@ def _plan_scouts(snap, mem, ledger, claimed, actions, short) -> None:
             return
 
 
-def _plan_infantry(snap, mem, ledger, claimed, actions, short) -> None:
+def _plan_infantry(snap, mem, ledger, claimed, actions, short, late=False) -> None:
     alive = sum(1 for u in snap.my_units if u["type"] == "Infantry")
     pending = mem.pending_unit_count("Infantry")
     n_bases = max(1, len(snap.my_bases_done))
     if short:
         target = 3
+    elif late:
+        # forced war: surplus gold is dead weight, convert it to bodies.
+        # NOT tied to base count — losing a base must never shrink the army cap.
+        target = 6 + min(24, ledger.gold // 500)
     elif snap.turn >= 0.6 * snap.max_turns:
-        target = min(12, 3 * n_bases + 2)  # endgame: all treaties void, wall up
+        target = min(12, 3 * n_bases + 2)
     else:
         target = min(8, 2 * n_bases + 2)
+    per_turn_cap = 6 if late else 2
     cost = UNIT_STATS["Infantry"].gold_cost
     made = 0
     for b in snap.my_buildings:
@@ -329,11 +356,11 @@ def _plan_infantry(snap, mem, ledger, claimed, actions, short) -> None:
         )
         if threat > 3 * (ours + UNIT_STATS["Infantry"].attack_power):
             continue
-        while alive + pending + made < target and made < 2 and ledger.can(cost):
+        while alive + pending + made < target and made < per_turn_cap and ledger.can(cost):
             if not _produce(snap, mem, ledger, claimed, actions, b, "Infantry"):
                 break
             made += 1
-        if made >= 2:
+        if made >= per_turn_cap:
             break
 
 
