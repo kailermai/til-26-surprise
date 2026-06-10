@@ -181,6 +181,19 @@ def _plan_combat_moves(
         return
     endgame = snap.turn >= _consolidate_turn(snap)
 
+    # KEEPS doctrine: garrison only the 2 most defensible bases — the ones
+    # farthest from known enemy bases. Smearing a small army across many spares
+    # guards nothing (seed 2: 15 bases, zero garrison anywhere); the un-kept
+    # spares are decoys that cost enemies time, not forts to die for.
+    if len(bases) > 2:
+        enemy_bases = [HexCoord(*i["coord"]) for i in mem.known_enemy_bases.values()]
+
+        def keep_score(b):
+            bc = HexCoord(b["q"], b["r"])
+            return min((grid.distance(bc, e) for e in enemy_bases), default=20)
+
+        bases = sorted(bases, key=keep_score, reverse=True)[:2]
+
     # per-base balance of power: hostile attack power vs ours, both within
     # DEFEND_RADIUS. A base where we're outgunned 3:1 is lost — evacuate
     # defenders to the safest base instead of feeding them in one at a time.

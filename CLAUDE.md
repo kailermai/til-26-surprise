@@ -137,6 +137,12 @@ python tools/arena.py --games 50
 # the REAL test — self-play, all 20 players run our agent:
 python tools/arena.py --games 20 --opponent-agent participant/src/agent.py
 
+# UNCONFOUNDED A/B — fixed sparring opponent (self-play changes all 19 opponents
+# whenever we change our agent; HunterBot stays constant between runs). It never
+# makes peace, scouts the map for our hidden Bases, and sieges with Artillery:
+python tools/arena.py --games 14 --opponent-agent tools/hunter_bot.py
+# (FREEZE RULE: never tune hunter_bot.py to be beatable — make hunter_bot_v2.py)
+
 # the arena is single-threaded (~30s/game at 300 turns) — for sweeps use the
 # parallel front-end, which shards seeds across CPU cores (~6-7x on a Ryzen 7,
 # identical seeds/stats, same flags plus --workers):
