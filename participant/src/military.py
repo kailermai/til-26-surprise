@@ -224,8 +224,13 @@ def _plan_combat_moves(
         here = HexCoord(u["q"], u["r"])
         hp_frac = u.get("hp", 1) / max(1, u.get("max_hp", 1))
 
-        # wounded units with no kill assignment back off toward home
-        if hp_frac < RETREAT_HP_FRACTION and u["id"] not in attackers_used:
+        # wounded units with no kill assignment back off toward home — UNLESS
+        # they're standing on a base's wall: a dying body on the ring still
+        # blocks a firing slot for turns, stepping away opens it immediately
+        on_wall = any(
+            grid.distance(here, HexCoord(b["q"], b["r"])) <= 1 for b in bases
+        )
+        if hp_frac < RETREAT_HP_FRACTION and u["id"] not in attackers_used and not on_wall:
             step = _step_away(snap, u, hostiles, claimed)
             if step is not None:
                 actions.append(MoveAction(unit_id=u["id"], path=[here, step]))
@@ -250,20 +255,30 @@ def _plan_combat_moves(
                 _advance(snap, mem, u, sc, claimed, actions, ctx)
             continue
 
-        # threats near MY assigned base → intercept the closest one
+        # threats near MY assigned base → RING defense: occupy the 6 tiles
+        # adjacent to the Base and HOLD. Every base-killer here is range 1, so
+        # a full ring means the Base cannot be hit at all — attackers must chew
+        # through 100 HP bodies that shoot back. Never chase: pursuing Scouts
+        # (move 3) with Infantry (move 1) drags the garrison out of position
+        # while the Base takes chip damage (seed 12: died with 6 idle Infantry).
         near_threats = [
             h
             for h in hostiles
             if grid.distance(HexCoord(h["q"], h["r"]), bc) <= DEFEND_RADIUS
         ]
         if near_threats:
-            tgt = min(
-                near_threats,
-                key=lambda h: grid.distance(here, HexCoord(h["q"], h["r"])),
-            )
-            goal = HexCoord(tgt["q"], tgt["r"])
-            if grid.distance(here, goal) > 1:
-                _advance(snap, mem, u, goal, claimed, actions, ctx)
+            if d_home <= 1:
+                continue  # on the wall — hold it, the attack pass shoots from here
+            ring = [
+                n
+                for n in grid.neighbors(bc)
+                if (n.q, n.r) not in snap.occupied and (n.q, n.r) not in claimed
+            ]
+            if ring:
+                spot = min(ring, key=lambda n: grid.distance(here, n))
+                _advance(snap, mem, u, spot, claimed, actions, ctx)
+            elif d_home > 2:
+                _advance(snap, mem, u, bc, claimed, actions, ctx)  # second layer
             continue
 
         # Once the war window approaches, don't let every unit idle in a tight
