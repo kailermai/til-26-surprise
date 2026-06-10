@@ -250,17 +250,56 @@ Do NOT revert v5 on the 64%→29% number alone. The post-mortems tell a differen
 - Opponents differ per stage (README): local `docker compose` = 19 **RandomAgents** (can't kill,
   ~100% survival for anything); Discord = 19 **stronger algo bots**; real comp = other teams.
 
-### How to improve from here (ranked by leverage)
-1. **Build a fixed "hunter" sparring bot** (single self-contained file like `algo_agent.py`, so
-   it doesn't collide with our agent's modules — see testing limit below). Scouts aggressively,
-   beelines for Bases, concentrates force. This is the #1 gap: it gives **unconfounded** signal
-   ("did survival vs the hunter go up?"), which self-play cannot. Unblocks all other tuning.
-2. **A/B turtle vs offense** against that hunter — settle whether v5's offensive doctrine helps
-   or hurts survival.
-3. **Stress-test the chat DoS (the likely "surprise").** We sanitize (`chat.py` caps msgs/len,
+### 🔴 v6 + hunter bot — THE BIG FINDING: self-play hid an early-rush death (2026-06-10)
+The hunter bot (`tools/hunter_bot.py`) is the fixed, unconfounded opponent we were missing —
+never makes peace, scouts for our Bases, marches Infantry waves + siege Artillery. v6 added
+concentrated defense (KEEPS: garrison only the 2 most defensible Bases; RING: hold the 6 tiles
+around a Base, never chase). Then we ran **v6 vs 19× hunter**:
+```bash
+python tools/arena_parallel.py --games 14 --opponent-agent tools/hunter_bot.py   # ~3-4 min (games end early)
+python tools/postmortem.py replays/arena/seed_4.jsonl   # then 6, 5 — the early deaths
+```
+- **7/14 survived, but deaths at turn 30–88 (median 38)** — NOT post-200 like self-play.
+- **Mechanism (post-mortems seed 4/6): by turn 30 we have 1–2 Infantry and get hit by 6–10.**
+  Our opening spends gold on Barracks + Scout + saving for a hidden Base and builds almost no
+  early defenders, so we're naked when the first wave lands. The early hidden Base dies too
+  (undefended, far). 
+- **Why this matters:** EVERY conclusion from self-play ("all deaths are post-200, hoard hidden
+  Bases for the endgame") was an ARTIFACT of self-play, where all 20 copies make peace until
+  turn 200. Against an opponent that won't make peace, our whole peace-then-endgame plan never
+  gets going. This is a real single-point-of-failure, and self-play's survival % is blind to it.
+- **Reassurance / calibration:** we still WON the Discord eval (survived 50 turns, 0 errors) —
+  the hunter kills by turn 38 but the real eval bots didn't, so **the hunter is HARDER than the
+  real opponents.** Treat it as a stress test, not a prediction of doom.
+
+### 🛠 #1 recommended upgrade — an EARLY DEFENSIVE FLOOR (helps vs "vibe-coded" rushers)
+Produce **4–6 Infantry ringing the main Base by ~turn 25**, BEFORE committing gold to hidden
+Bases. Directly answers the turn-30 death. Likely files: `economy.py` (raise the early Infantry
+target; don't let "saving for a Base" starve early defense), and keep early expansion close
+enough to share the garrison (delay far Bases until a defensive core exists).
+
+**Will this help vs other teams' agents (incl. quick / AI-generated algos)? Yes — asymmetrically.**
+- Many hastily-built algos are naive aggressive rushers — note our OWN `algo_agent.py` template
+  literally "charges the nearest enemy." A lot of teams' first-pass agents will behave like that.
+- **Early defense is asymmetric insurance, NOT overfitting to the hunter:**
+  - vs a *peaceful* opponent: a few early Infantry cost almost nothing (slightly slower expansion);
+    we already survive those (self-play).
+  - vs an *aggressive* opponent: those same Infantry are the difference between dying at t30 and living.
+  - It's a 20-player FFA — even if most teams turtle, you have 2–4 neighbors and it only takes ONE
+    rusher to end you early. Early defense removes that single point of failure.
+- **Anti-overfitting guard (critical):** test every change against BOTH `--opponent-agent
+  tools/hunter_bot.py` (aggression) AND `--opponent-agent participant/src/agent.py` (peaceful
+  self-play). A good change lifts hunter survival WITHOUT tanking self-play. Build GENERAL early
+  robustness, never hunter-specific counters (don't tune to its exact wave size). Respect the
+  hunter FREEZE RULE — if you need a tougher benchmark, add `hunter_bot_v2.py`, keep old numbers comparable.
+
+### Other improvements (ranked, lower priority than the early floor)
+1. **A/B turtle vs offense** against the hunter — settle whether v5/v6's offensive doctrine helps
+   or hurts survival now that defense is concentrated.
+2. **Stress-test the chat DoS (the likely "surprise").** We sanitize (`chat.py` caps msgs/len,
    planners never read chat text), but VERIFY it: feed `decide()` an obs with ~10k oversized
    chat messages and measure the time. Flat = defense holds; spikes = a real hole to plug.
-4. **Harden timing** — see below.
+3. **Harden timing** — see below.
 
 ### ⏱ decide() time is creeping — Docker check is now overdue
 Slowest `decide()`: v1 ~0.8s → v2 ~1.3s → v3 ~1.9s → **v5 ~2.25s** in 300-turn self-play (more
