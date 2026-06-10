@@ -48,7 +48,10 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # skip a truncated/partial line (e.g. mid-write) — don't crash
             turn = rec.get("turn", 0)
             snap = rec.get("state_snapshot", {})
             entities = snap.get("entities", {})

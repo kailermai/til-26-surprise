@@ -184,43 +184,63 @@ python tools/postmortem.py replays/arena/seed_6.jsonl
 python tools/postmortem.py replays/arena/seed_6.jsonl --player player-3   # autopsy anyone
 ```
 
-## ⚠️ Open investigation (2026-06-10) — VERIFY before trusting, do not take on faith
+## ⚠️ Open investigation — VERIFY before trusting, do not take on faith
 
 These are findings from arena sweeps + post-mortems. **Re-run the commands and confirm
 the numbers yourself before acting** — they are a snapshot of one set of seeds, the
 agent code changes underneath this note, and small-n survival % has wide error bars.
-
-**The headline: our agent dies rich.** In every loss examined (v2, self-play, seeds 3/5/
-9/12/13/14), the agent was eliminated holding **~24k–28k unspent gold** with only 1–2
-Bases. All deaths land just after the **turn-200 treaty cutoff** (median ~220), i.e. the
-forced-open-war endgame. Reproduce:
+Standard repro (14 seeds, comparable across versions):
 ```bash
 python tools/arena_parallel.py --games 14 --opponent-agent participant/src/agent.py
-python tools/postmortem.py replays/arena/seed_3.jsonl   # then 5, 14, ...
+python tools/postmortem.py replays/arena/seed_6.jsonl   # then 8, 9, 2, 13, ...
 ```
 
-**The real bottleneck is base COUNT, and base count is gated by SCOUT VISION, not gold.**
-A Base may only be founded on an empty tile *you currently see* — with 1–2 Scouts you can
-only survey one site at a time, so the agent founds 1–2 Bases a game **no matter how much
-gold it has**. The "spare hidden Base" is our single biggest survival lever (see strategy
-north star) and we are bottlenecked at ~2 of them. Hypothesis to test: **many more Scouts
-surveying many sites in parallel** is what unlocks gold→Bases, *not* raising the base-count
-target. Verify by checking `bases over the whole game` in post-mortems before/after.
+### Version history (self-play, seeds 1–14, same 14 seeds each time)
+- **v1**: 9/14 (64%), deaths ~236–295. Dies on ~24–28k gold, 1–2 Bases.
+- **v2**: 7/14 (50%), deaths ~209–255. "Dump gold" caps + pickier base siting —
+  *regressed* (a `base_site_threat>=8` gate made some seeds build only ONE Base).
+- **v3**: 9/14 (64%), deaths ~221–246 (later than v2). Opportunistic founding +
+  more Scouts. **Base count fixed**: 12–26 Bases/game (was 1–2). Gold often drained.
+- Trend is up, but n=14 CI is ±~20 pts — treat version deltas as suggestive, confirm
+  with a 50-game run before declaring a winner.
 
-**A v2 change appears to have regressed base-founding (needs confirmation).** The
-`_plan_base` gate in `economy.py` that holds out for a site with `base_site_threat >= 8`
-made seed 3 refuse to commit to *any* nearby site and **never build a second Base** (died
-turn 209, one Base, 27.7k gold). On crowded maps every site is near someone. Check whether
-this gate is net-negative (compare base counts with it on vs off).
+### v3 RESOLVED two earlier findings (kept for the record)
+- *Dies rich* + *base count gated by scout vision, not gold* → fixed. v3 founds a Base on
+  any visible tile clearing a quality bar, and runs 3–4 Scouts. Post-mortems now show
+  12–26 Bases/game and gold drained to single digits-k in several losses. ✅
+- *v2 `base_site_threat>=8` gate regressed base-founding* → confirmed and removed in v3
+  (threat distance now relaxes over time: 8→6→4). ✅
 
-**Self-play survival % is a CONFOUNDED A/B.** When `--opponent-agent` is our own agent,
-changing our agent also changes all 19 opponents, so the whole meta shifts and survival %
-moves for reasons unrelated to whether our change helped. The clean test is **our new
-agent vs 19 copies of the OLD agent** (opponents held fixed) — materialise the old version
-in a git worktree and point `--opponent-agent` at it. Treat raw self-play deltas as
-suggestive, not proof. Also: with n=14 the 95% CI spans ~±20 points — don't read a 50%
-vs 64% gap as real without more games.
+### v4 — the TWO failure modes v3's losses now expose (next targets)
+Post-mortem every v3 loss (seeds 6/8/9/2/13) and you see the SAME two things:
 
-**Watch decide() time.** The v2 threat/power loops pushed slowest `decide()` from ~0.8s to
-~1.3s in 300-turn self-play. Still far under 10s, but the trend matters — confirm under
-`docker compose up`, the only real deadline check.
+1. **Bases are founded too LATE — reactively, during the war.** Founding turns cluster at
+   t0–t80, then a *dead gap* to ~t180, then a flood of 12+ Bases at **t181–t227**. The
+   aggressive expansion only triggers at turn 180 (the `late` flag = `TREATY_CUTOFF−20`),
+   so we spam Bases *after* treaties void — exactly when 19 hostile armies are hunting, and
+   each Base gets razed 1–10 turns after it completes. A hidden Base only works if it is
+   **standing and hidden BEFORE the war.** Fix direction: expand hard during the *peacetime*
+   window (turns ~50–180), while treaties protect us, so Bases are already built and
+   scattered when turn 200 hits. Verify: check the `founded t…` column spreads across
+   50–180 instead of bunching at 181+.
+
+2. **ZERO defenders — every single v3 loss ended with `units: {}`.** We now over-correct:
+   nearly all gold goes to Bases, none to a standing army, so each Base sits undefended and
+   a handful of Infantry (or 1–5 Artillery) walks in and razes it. We swung from v2's
+   "hoard gold, 2 Bases" to v3's "spam Bases, no army." Fix direction: **balance** — keep a
+   real garrison (Infantry + a few Artillery, which out-range Infantry on defense) AND keep
+   expanding; don't spend 100% on Bases. Verify: losses should end with a non-empty `units:`
+   and Bases that survive more than a few turns past completion.
+
+Caveat on testing: self-play is a **confounded A/B** — changing our agent also changes all
+19 opponents, so survival % shifts for reasons unrelated to whether our change helped. The
+clean test is our new agent vs 19 copies of the OLD agent (git-worktree the old version,
+point `--opponent-agent` at it). Treat raw self-play deltas as suggestive, not proof.
+
+### ⏱ decide() time is creeping — needs a Docker check
+Slowest `decide()`: v1 ~0.8s → v2 ~1.3s → **v3 ~1.9s** in 300-turn self-play (managing
+16–26 Bases costs per-turn loops). Still under 10s in-process, BUT the arena runs on a fast
+laptop core with no cap — under Docker's real **1-CPU / 1 GiB** limit this can be 2–3× higher,
+i.e. 4–6s, approaching the wall. **Confirm with `docker compose up --build`** (the only test
+that enforces the real deadline) before trusting that v3 is submission-safe. If it's tight,
+budget-cap the Base-management loops the way A* is already rationed in `military.py`.
