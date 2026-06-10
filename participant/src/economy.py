@@ -320,7 +320,7 @@ def _plan_barracks(
         target = min(8, max(4, bases + 2))
     elif war_prep:
         target = min(5, max(3, bases))
-    elif snap.turn >= 50:
+    elif snap.turn >= 12:
         target = 2
     else:
         target = 1
@@ -328,15 +328,17 @@ def _plan_barracks(
     per_turn = 4 if late or overflow else (2 if war_prep else 1)
     built = 0
     while count < target and built < per_turn:
-        force = count == 0 or overflow or late
-        if not ledger.can(cost, force=force):
+        opening_second_barracks = snap.turn >= 12 and count < 2
+        spend_force = count == 0 or opening_second_barracks or overflow or late
+        high_pressure = overflow or late
+        if not ledger.can(cost, force=spend_force):
             return
         site = _adjacent_build_site(
-            snap, mem, claimed, allow_threat=force, keep_spawns=not force
+            snap, mem, claimed, allow_threat=high_pressure, keep_spawns=not high_pressure
         )
         if site is None:
             return
-        ledger.spend(cost, force=force)
+        ledger.spend(cost, force=spend_force)
         actions.append(
             ConstructBuildingAction(building_type="Barracks", coord=HexCoord(*site))
         )
@@ -418,15 +420,17 @@ def _plan_factory(
     per_turn = 2 if late or overflow or war_prep else 1
     built = 0
     while count < target and built < per_turn:
-        force = overflow or late
-        if not ledger.can(cost, force=force):
+        opening_factory = snap.turn >= 40 and count == 0
+        spend_force = opening_factory or overflow or late
+        high_pressure = overflow or late
+        if not ledger.can(cost, force=spend_force):
             return
         site = _adjacent_build_site(
-            snap, mem, claimed, allow_threat=force, keep_spawns=not force
+            snap, mem, claimed, allow_threat=high_pressure, keep_spawns=not high_pressure
         )
         if site is None:
             return
-        ledger.spend(cost, force=force)
+        ledger.spend(cost, force=spend_force)
         actions.append(
             ConstructBuildingAction(building_type="Factory", coord=HexCoord(*site))
         )
@@ -510,9 +514,13 @@ def _adjacent_build_site(
 def _plan_scouts(snap, mem, ledger, claimed, actions, short, late, saving) -> None:
     alive = sum(1 for u in snap.my_units if u["type"] == "Scout")
     pending = mem.pending_unit_count("Scout")
+    infantry = sum(1 for u in snap.my_units if u["type"] == "Infantry")
+    infantry += mem.pending_unit_count("Infantry")
     # base count is gated by VISION, not gold: a Base needs a visible tile, so
     # more Scouts = more sites surveyed in parallel = more spare Bases
     if short:
+        target = 1
+    elif snap.turn < 35 and infantry < 5:
         target = 1
     elif late:
         target = 4
@@ -540,6 +548,10 @@ def _plan_infantry(
     n_bases = max(1, len(snap.my_bases_done))
     if short:
         target = 3
+    elif snap.turn < 25:
+        target = 5
+    elif snap.turn < 60:
+        target = 10
     elif late or overflow:
         target = max(24, 4 * n_bases + min(60, ledger.gold // 250))
     elif war_prep:
@@ -551,7 +563,7 @@ def _plan_infantry(
     if need_defense:
         target = max(target, EARLY_DEFENSE_FLOOR)  # never below the garrison floor
     force = overflow or late or need_defense
-    per_turn_cap = 30 if late or overflow else (10 if war_prep else (4 if need_defense else 3))
+    per_turn_cap = 30 if late or overflow else (10 if war_prep else (5 if need_defense else 3))
     cost = UNIT_STATS["Infantry"].gold_cost
     made = 0
     for b in snap.my_buildings:
@@ -610,6 +622,10 @@ def _plan_heavy_units(
         artillery_target = 6
         tank_target = 4
         per_turn_cap = 8
+    elif snap.turn < 90:
+        artillery_target = 4
+        tank_target = 2
+        per_turn_cap = 4
     else:
         artillery_target = 2
         tank_target = 2
@@ -624,8 +640,10 @@ def _plan_heavy_units(
                 unit_type = "Tank"
             else:
                 return
+            opening_heavy = snap.turn < 90 and artillery < 4
+            use_force = overflow or late or opening_heavy
             if not _produce(
-                snap, mem, ledger, claimed, actions, b, unit_type, force=overflow or late
+                snap, mem, ledger, claimed, actions, b, unit_type, force=use_force
             ):
                 break
             if unit_type == "Artillery":
