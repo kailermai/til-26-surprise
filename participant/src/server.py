@@ -95,17 +95,15 @@ log = logging.getLogger("player")
 
 
 def make_agent() -> PlayerAgent:
+    # AGENT=llm is MainAgent PLUS the chat-only LLM layer (llm_layer.py), not a
+    # separate path — the naive llm_agent.py template stays on disk as a
+    # reference/sparring partner only. Fall back to the template baseline if
+    # MainAgent ever fails to import (a running baseline beats a dead server).
     kind = os.environ.get("AGENT", "algo").lower()
-    if kind == "llm":
-        from llm_agent import LLMAgent  # needs OPENROUTER_API_KEY
-
-        return LLMAgent()
-    # default: our deterministic agent; fall back to the template baseline if it
-    # ever fails to import (a running baseline beats a dead server)
     try:
         from agent import MainAgent
 
-        return MainAgent()
+        return MainAgent(llm_enabled=(kind == "llm"))
     except Exception:
         logging.getLogger("player").exception(
             "MainAgent import failed — falling back to AlgoAgent"
