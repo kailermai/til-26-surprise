@@ -15,6 +15,7 @@ import time
 from engine.actions import AttackAction, MoveAction
 from engine.constants import (
     ARTILLERY_SPLASH_RADIUS,
+    BUILDING_STATS,
     DIFFICULT_TERRAIN_MOVE_COST,
     ELEVATION_ATTACK_BONUS,
     TREATY_CUTOFF_TURN,
@@ -71,6 +72,8 @@ def _unit_damage(snap: Snapshot, unit: dict, vs_building: bool = False) -> int:
     power = unit.get("attack_power", 0)
     if snap.terrain.get((unit["q"], unit["r"])) == "elevated":
         power = int(power * ELEVATION_ATTACK_BONUS)
+    if vs_building and unit.get("type") == "Bomber":
+        power = int(power * 4)
     return power
 
 
@@ -98,7 +101,19 @@ def _plan_attacks(snap, mem, actions, combat, hostile_all) -> set[str]:
         ec = HexCoord(e["q"], e["r"])
         return min((grid.distance(ec, b) for b in my_bld), default=99)
 
-    # engage only doorstep threats and proven aggressors
+    def in_weapon_range(e) -> bool:
+        ec = HexCoord(e["q"], e["r"])
+        return any(
+            0 < grid.distance(HexCoord(u["q"], u["r"]), ec) <= u.get("attack_range", 0)
+            for u in combat
+        )
+
+    def is_objective(e) -> bool:
+        return e.get("type") in ("Base", "Barracks", "Factory", "Airbase")
+
+    # Engage doorstep threats, and let expeditionary units attack strategic
+    # buildings once they reach them. Otherwise an army that walks to an enemy
+    # Base would hold fire because the target is not near one of our buildings.
     targets = [
         e
         for e in hostile_all
@@ -106,6 +121,11 @@ def _plan_attacks(snap, mem, actions, combat, hostile_all) -> set[str]:
         or (e["owner_id"] in mem.aggressors and near_us(e) <= ENGAGE_RADIUS + 2)
         or snap.turn >= TREATY_CUTOFF_TURN
         and near_us(e) <= ENGAGE_RADIUS
+        or (
+            is_objective(e)
+            and in_weapon_range(e)
+            and (snap.turn >= TREATY_CUTOFF_TURN - 40 or e["id"] in mem.known_enemy_bases)
+        )
     ]
     # closest-to-home, then most killable first
     targets.sort(key=lambda e: (near_us(e), e.get("hp", 999)))
@@ -124,7 +144,8 @@ def _plan_attacks(snap, mem, actions, combat, hostile_all) -> set[str]:
                 cands.append(u)
         if not cands:
             continue
-        cands.sort(key=lambda u: -_unit_damage(snap, u))
+        vs_building = tgt.get("type") in BUILDING_STATS
+        cands.sort(key=lambda u: -_unit_damage(snap, u, vs_building))
         hp = tgt.get("hp", 0)
         dealt = 0
         chosen = []
@@ -132,9 +153,9 @@ def _plan_attacks(snap, mem, actions, combat, hostile_all) -> set[str]:
             if dealt >= hp:
                 break
             chosen.append(u)
-            dealt += _unit_damage(snap, u)
+            dealt += _unit_damage(snap, u, vs_building)
         # chip damage is fine on doorstep threats; otherwise only commit to kills
-        if dealt < hp and near_us(tgt) > 2:
+        if dealt < hp and near_us(tgt) > 2 and not is_objective(tgt):
             continue
         for u in chosen:
             actions.append(AttackAction(unit_id=u["id"], target=tc))
@@ -179,6 +200,10 @@ def _plan_combat_moves(
         base_threat[i] = threat
         base_overwhelmed[i] = threat > 3 * (ours + 30)
     safest = min(range(len(bases)), key=lambda i: base_threat[i])
+    offensive_goals = [
+        info for info in mem.known_enemy_bases.values() if snap.hostile(info["owner"])
+    ]
+    departures: dict[int, int] = {i: 0 for i in range(len(bases))}
 
     for u in combat:
         if time.monotonic() > deadline:
@@ -226,6 +251,32 @@ def _plan_combat_moves(
             goal = HexCoord(tgt["q"], tgt["r"])
             if grid.distance(here, goal) > 1:
                 _advance(snap, mem, u, goal, claimed, actions, ctx)
+            continue
+
+        # Once the war window approaches, don't let every unit idle in a tight
+        # garrison. Keep a floor at home and send surplus combat power toward
+        # remembered enemy Bases to reduce the pressure coming at us.
+        local_combat = sum(
+            1
+            for v in combat
+            if grid.distance(HexCoord(v["q"], v["r"]), bc) <= DEFEND_RADIUS
+        )
+        desired_garrison = 4 if endgame else 3
+        offensive_type = u["type"] in ("Tank", "Artillery", "Fighter", "Bomber")
+        if (
+            offensive_goals
+            and (endgame or snap.turn >= TREATY_CUTOFF_TURN - 40 or len(combat) > 12)
+            and (offensive_type or len(combat) > 16)
+            and local_combat - departures[bi] > desired_garrison
+        ):
+            tgt = min(
+                offensive_goals,
+                key=lambda i: grid.distance(here, HexCoord(*i["coord"])),
+            )
+            goal = HexCoord(*tgt["coord"])
+            if grid.distance(here, goal) > max(1, u.get("attack_range", 1)):
+                _advance(snap, mem, u, goal, claimed, actions, ctx)
+            departures[bi] += 1
             continue
 
         # peacetime / endgame posture: stay within the garrison ring
