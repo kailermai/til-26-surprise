@@ -180,6 +180,7 @@ class Memory:
         self.aggressors: set[str] = set()
         self.base_site_target: Coord | None = None
         self.base_site_turn = -99  # when the site was last (re)chosen
+        self.base_site_threat = 99  # distance from the chosen site to nearest threat
         self.scout_goals: dict[str, Coord] = {}
         self.last_proposed: dict[str, int] = {}
         self.greeted: set[str] = set()

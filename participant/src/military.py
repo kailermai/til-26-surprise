@@ -148,6 +148,26 @@ def _plan_combat_moves(
         return
     endgame = snap.turn >= _consolidate_turn(snap)
 
+    # per-base balance of power: hostile attack power vs ours, both within
+    # DEFEND_RADIUS. A base where we're outgunned 3:1 is lost — evacuate
+    # defenders to the safest base instead of feeding them in one at a time.
+    def power_near(bc: HexCoord, units: list[dict]) -> int:
+        return sum(
+            e.get("attack_power", 0)
+            for e in units
+            if grid.distance(HexCoord(e["q"], e["r"]), bc) <= DEFEND_RADIUS
+        )
+
+    base_threat: dict[int, int] = {}
+    base_overwhelmed: dict[int, bool] = {}
+    for i, b in enumerate(bases):
+        bc = HexCoord(b["q"], b["r"])
+        threat = power_near(bc, hostiles)
+        ours = power_near(bc, combat)
+        base_threat[i] = threat
+        base_overwhelmed[i] = threat > 3 * (ours + 30)
+    safest = min(range(len(bases)), key=lambda i: base_threat[i])
+
     for u in combat:
         if time.monotonic() > deadline:
             return
@@ -165,11 +185,20 @@ def _plan_combat_moves(
             continue  # attack from where we stand; don't drift out of position
 
         # home base assignment: nearest base
-        base = min(
-            bases, key=lambda b: grid.distance(here, HexCoord(b["q"], b["r"]))
+        bi = min(
+            range(len(bases)),
+            key=lambda i: grid.distance(here, HexCoord(bases[i]["q"], bases[i]["r"])),
         )
+        base = bases[bi]
         bc = HexCoord(base["q"], base["r"])
         d_home = grid.distance(here, bc)
+
+        # a lost cause is not defended — fall back to the safest base
+        if base_overwhelmed[bi] and safest != bi:
+            sc = HexCoord(bases[safest]["q"], bases[safest]["r"])
+            if grid.distance(here, sc) > 2:
+                _advance(snap, mem, u, sc, claimed, actions)
+            continue
 
         # threats near MY assigned base → intercept the closest one
         near_threats = [

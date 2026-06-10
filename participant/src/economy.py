@@ -39,7 +39,7 @@ def plan(
     if short:
         target_bases = 2
     else:
-        target_bases = 2 if snap.turn < 0.4 * snap.max_turns else 3
+        target_bases = 2 if snap.turn < 0.25 * snap.max_turns else 3
     # stop founding bases too late to complete (they only count when finished)
     if snap.turn > snap.max_turns - BUILDING_STATS["Base"].build_turns - 3:
         target_bases = 0
@@ -63,6 +63,16 @@ def plan(
 
 def _plan_base(snap, mem, ledger, claimed, actions, short) -> None:
     site = _ensure_base_site(snap, mem, short)
+    # a "hidden" Base 5 tiles from a besieged main base is just a second target:
+    # hold out for a genuinely distant site while there's still time to scout one
+    site_deadline = 10 if short else 30
+    if (
+        not short
+        and site is not None
+        and mem.base_site_threat < 8
+        and snap.turn < site_deadline
+    ):
+        return  # keep scouting for a quieter spot
     if (
         site is not None
         and site in snap.visible
@@ -106,10 +116,10 @@ def _ensure_base_site(snap, mem, short) -> Coord | None:
         for i in mem.last_seen_enemy.values()
         if snap.turn - i["turn"] <= 15
     ]
-    lo, hi = (2, 7) if short else (5, 14)
+    lo, hi = (2, 7) if short else (7, 17)
     own = {(b["q"], b["r"]) for b in snap.my_buildings}
 
-    best, best_score = None, -1e9
+    best, best_score, best_threat = None, -1e9, 99
     candidates = list(mem.explored)
     step = 2 if len(candidates) > 500 else 1  # sample large maps for speed
     for c in candidates[::step]:
@@ -124,10 +134,11 @@ def _ensure_base_site(snap, mem, short) -> Coord | None:
         if mem.terrain_map.get(c) == "difficult":
             score -= 1.0  # slow to reach / garrison
         if score > best_score:
-            best, best_score = c, score
+            best, best_score, best_threat = c, score, d_threat
     if best is not None:
         mem.base_site_target = best
         mem.base_site_turn = snap.turn
+        mem.base_site_threat = best_threat
     return mem.base_site_target
 
 
@@ -161,6 +172,8 @@ def _plan_mines(snap, mem, ledger, claimed, actions, short) -> None:
     mines += mem.pending_build_count("Mine")
     cost = BUILDING_STATS["Mine"].gold_cost
 
+    first = mines == 0
+
     # a Mine on a rich tile yields 50/turn — worth dipping into the Base reserve
     # for the first one
     if mines < 3:
@@ -173,9 +186,9 @@ def _plan_mines(snap, mem, ledger, claimed, actions, short) -> None:
                     c in mem.rich_tiles
                     and c not in snap.occupied
                     and c not in claimed
-                    and ledger.can(cost, force=mines == 0)
+                    and ledger.can(cost, force=first)
                 ):
-                    ledger.spend(cost, force=mines == 0)
+                    ledger.spend(cost, force=first)
                     actions.append(
                         ConstructBuildingAction(building_type="Mine", coord=nb)
                     )
@@ -183,7 +196,23 @@ def _plan_mines(snap, mem, ledger, claimed, actions, short) -> None:
                     claimed.add(c)
                     return
 
-    # plain Mines: long games only, after the expansion plan is funded
+    # the FIRST Mine is bought before saving for the Base: staying on 10 gold/turn
+    # starves both defense and expansion (a Mine repays itself in 10 turns)
+    if first:
+        if not ledger.can(cost, force=True):
+            return
+        site = _adjacent_build_site(snap, mem, claimed)
+        if site is None:
+            return
+        ledger.spend(cost, force=True)
+        actions.append(
+            ConstructBuildingAction(building_type="Mine", coord=HexCoord(*site))
+        )
+        mem.pending_builds[site] = {"type": "Mine", "turn": snap.turn}
+        claimed.add(site)
+        return
+
+    # further plain Mines: long games only, once the expansion is funded
     if short or mines >= 2 or not ledger.can(cost):
         return
     site = _adjacent_build_site(snap, mem, claimed)
@@ -233,6 +262,10 @@ def _adjacent_build_site(snap, mem, claimed) -> Coord | None:
     for b in snap.my_buildings:
         if not b.get("is_complete", True):
             continue
+        # never anchor new construction on a building under siege — it will be
+        # razed before it pays for itself
+        if mem.threat_near(snap, (b["q"], b["r"]), 4) > 60:
+            continue
         bc = HexCoord(b["q"], b["r"])
         free = [
             n
@@ -281,6 +314,20 @@ def _plan_infantry(snap, mem, ledger, claimed, actions, short) -> None:
     made = 0
     for b in snap.my_buildings:
         if b["type"] != "Barracks" or not b.get("is_complete", True):
+            continue
+        # don't trickle units into a hopeless siege — bank the gold for the
+        # next Base instead (units die one by one against a massed swarm)
+        threat = mem.threat_near(snap, (b["q"], b["r"]), 5)
+        ours = sum(
+            u.get("attack_power", 0)
+            for u in snap.my_units
+            if u["type"] != "Scout"
+            and snap.grid.distance(
+                HexCoord(u["q"], u["r"]), HexCoord(b["q"], b["r"])
+            )
+            <= 5
+        )
+        if threat > 3 * (ours + UNIT_STATS["Infantry"].attack_power):
             continue
         while alive + pending + made < target and made < 2 and ledger.can(cost):
             if not _produce(snap, mem, ledger, claimed, actions, b, "Infantry"):
