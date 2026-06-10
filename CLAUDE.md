@@ -84,14 +84,18 @@ They meet only at `agent.py`, which both can stub immediately.
 
 ```
 participant/src/          ← SUBMITTED image; only edit here
-  algo_agent.py  the agent we submit (teammate fills this out)    (Person 1)
+  agent.py       MainAgent — the agent we ACTUALLY submit; wires the planners
+                 under the time budget (server.py loads this)     (Person 1)
+  algo_agent.py  the UNTOUCHED starter template — server.py's fallback if
+                 MainAgent fails to import; useful only as a weak sparring partner
   state.py       SHARED — obs parsing + distance/threat/vision    (Person 1 owns, freeze early)
   economy.py     build order, Base placement, expansion           (Person 1)
   military.py    target selection, movement, retreat              (Person 1)
   diplomacy.py   treaties, known_players tracking                 (Person 2)
   chat.py        incoming-chat sanitization + optional outgoing   (Person 2)
 
-tools/arena.py   headless multi-seed tournament + stats   (Person 2)  ← DONE, at repo root
+tools/arena.py            headless multi-seed tournament + stats   (Person 2)  ← DONE, at repo root
+tools/arena_parallel.py   same tournament sharded across all CPU cores (same flags + --workers)
 ```
 
 **Why arena lives at the repo root, not in `participant/src/tools/`:** it imports the
@@ -100,7 +104,7 @@ game harness (`game_runner`, `schemas`, `baseline_random`, `replay`) which lives
 image. It loads the agent under test from `participant/src/` by file path.
 
 Each strategy planner is a near-pure function of `state` → list of actions, so they merge
-cleanly in `algo_agent.py`'s `decide()`.
+cleanly in `agent.py`'s `decide()`.
 
 ## Don't do these
 
@@ -115,15 +119,37 @@ cleanly in `algo_agent.py`'s `decide()`.
 
 ## How to run
 
+> **Which file is "the agent"?** Our real agent is **`MainAgent` in
+> `participant/src/agent.py`** — server.py loads it for Docker/submission (falling back
+> to the template only if its import fails), and it is the arena's default `--agent`.
+> `participant/src/algo_agent.py` is the **untouched starter template** — only useful
+> as a weak sparring partner. The arena header prints which file it loaded
+> (`agent=agent.py`) — glance at it before trusting any numbers.
+
 ```bash
 # full local match over HTTP — prints PASS/FAIL + writes a replay.
 # The ONLY check that enforces the real 10s deadline + 1 CPU / 1 GiB limits.
 docker compose up --build
 
-# fast survival signal across many seeds (in-process; does NOT test the 10s limit):
+# fast survival signal across many seeds (in-process; does NOT test the 10s limit).
+# Defaults to our real agent (agent.py) vs 19 RandomAgents:
 python tools/arena.py --games 50
-python tools/arena.py --opponent-agent participant/src/algo_agent.py   # a REAL test
+# the REAL test — self-play, all 20 players run our agent:
+python tools/arena.py --games 20 --opponent-agent participant/src/agent.py
+
+# the arena is single-threaded (~30s/game at 300 turns) — for sweeps use the
+# parallel front-end, which shards seeds across CPU cores (~6-7x on a Ryzen 7,
+# identical seeds/stats, same flags plus --workers):
+python tools/arena_parallel.py --games 50 --opponent-agent participant/src/agent.py
+
+# faster still while iterating: Discord-eval length + skip replay writes
+# (OneDrive sync makes replay writes slow on our laptops):
+python tools/arena_parallel.py --games 50 --max-turns 50 --no-replays --opponent-agent participant/src/agent.py
 ```
+
+Windows note: if `python` hits `ModuleNotFoundError: httpx`, the terminal is resolving
+to an interpreter without it — use the full path `C:\Python313\python.exe` (or
+`pip install httpx` into whatever interpreter you're running).
 
 ## The arena — `tools/arena.py` (Person 2's tool, already built)
 
@@ -134,10 +160,13 @@ turn, and won-outright count. Saves a replay **only for games you lose**, under
 `--max-turns N`, `--map WxH`, `--no-replays`.
 
 **Findings from the first runs — read these, they shape how you test:**
+- **The default `--agent` is our real agent** (`agent.py` / MainAgent — changed from the
+  template on 2026-06-10). The arena header prints which file it loaded; check it says
+  `agent=agent.py` before trusting a run.
 - **Survival vs the RandomAgent baseline is ~100% for everything** — even an agent that
-  does *nothing* survives. The randoms can't kill anyone. So a bare `python tools/arena.py`
-  number is meaningless; always test with `--opponent-agent participant/src/algo_agent.py`
-  (or our own agent) to get real signal.
+  does *nothing* survives. The randoms can't kill anyone. So an arena run without
+  `--opponent-agent` is meaningless; spar against our own agent
+  (`--opponent-agent participant/src/agent.py`) to get real signal.
 - **Eliminations are rare**: infantry move 1 tile/turn and bases have 300 HP on the 35×30
   map, so destroying a base takes ages. Survival is the easy default — which is *why* the
   meta is "don't die," and why you need a real opponent to tell strong agents from lazy ones.

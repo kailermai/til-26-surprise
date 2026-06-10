@@ -69,7 +69,9 @@ from game_runner import GameConfig, GameRunner, PlayerRegistration  # noqa: E402
 from schemas.observation import build_observation  # noqa: E402
 
 PARTICIPANT_ID = "player-0"
-DEFAULT_AGENT = os.path.join(_REPO, "participant", "src", "algo_agent.py")
+# agent.py = MainAgent, the agent we actually submit (server.py loads it too);
+# algo_agent.py is just the untouched starter template / fallback
+DEFAULT_AGENT = os.path.join(_REPO, "participant", "src", "agent.py")
 REPLAY_DIR = os.path.join(_REPO, "replays", "arena")
 
 
@@ -245,7 +247,7 @@ def main() -> None:
         description="In-process survival tournament for a TIL-26 agent."
     )
     ap.add_argument("--agent", default=DEFAULT_AGENT,
-                    help="path to the agent .py (default: shipped algo_agent.py)")
+                    help="path to the agent .py (default: agent.py, our real MainAgent)")
     ap.add_argument("--games", type=int, default=50,
                     help="number of seeds to play (default 50)")
     ap.add_argument("--start-seed", type=int, default=1,
