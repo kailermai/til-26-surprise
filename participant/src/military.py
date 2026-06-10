@@ -119,6 +119,9 @@ def _plan_attacks(snap, mem, actions, combat, hostile_all) -> set[str]:
         for e in hostile_all
         if near_us(e) <= ENGAGE_RADIUS
         or (e["owner_id"] in mem.aggressors and near_us(e) <= ENGAGE_RADIUS + 2)
+        # at war = shoot on sight: strike forces walking to an aggressor's base
+        # must fight the defenders shooting them, not march past politely
+        or (e["owner_id"] in mem.aggressors and in_weapon_range(e))
         or snap.turn >= TREATY_CUTOFF_TURN
         and near_us(e) <= ENGAGE_RADIUS
         or (
@@ -277,6 +280,26 @@ def _plan_combat_moves(
             if ring:
                 spot = min(ring, key=lambda n: grid.distance(here, n))
                 _advance(snap, mem, u, spot, claimed, actions, ctx)
+                continue
+            # no free slot (our own buildings usually fill the ring) — but an
+            # enemy STANDING next to our Base is a committed besieger, not a
+            # kiter: step to contact and kill it. Parking at distance 2 left
+            # range-1 defenders watching Scouts chip the Base down (seed 12).
+            besiegers = [
+                h
+                for h in near_threats
+                if grid.distance(HexCoord(h["q"], h["r"]), bc) <= 1
+            ]
+            if besiegers:
+                tgt = min(
+                    besiegers,
+                    key=lambda h: grid.distance(here, HexCoord(h["q"], h["r"])),
+                )
+                # goal tile is occupied by the enemy — _advance stops adjacent,
+                # which is exactly firing range
+                _advance(
+                    snap, mem, u, HexCoord(tgt["q"], tgt["r"]), claimed, actions, ctx
+                )
             elif d_home > 2:
                 _advance(snap, mem, u, bc, claimed, actions, ctx)  # second layer
             continue
@@ -291,21 +314,31 @@ def _plan_combat_moves(
         )
         desired_garrison = 4 if endgame else 3
         offensive_type = u["type"] in ("Tank", "Artillery", "Fighter", "Bomber")
-        if (
-            offensive_goals
-            and (endgame or snap.turn >= TREATY_CUTOFF_TURN - 40 or len(combat) > 12)
-            and (offensive_type or len(combat) > 16)
-            and local_combat - departures[bi] > desired_garrison
-        ):
+        if offensive_goals and local_combat - departures[bi] > desired_garrison:
+            # punish whoever is hitting us first, nearest first: a dead
+            # neighbour stops sending waves permanently (a one-base rusher is
+            # ELIMINATED outright and its army decays) — the moat strategy
             tgt = min(
                 offensive_goals,
-                key=lambda i: grid.distance(here, HexCoord(*i["coord"])),
+                key=lambda i: (
+                    i["owner"] not in mem.aggressors,
+                    grid.distance(here, HexCoord(*i["coord"])),
+                ),
             )
             goal = HexCoord(*tgt["coord"])
-            if grid.distance(here, goal) > max(1, u.get("attack_range", 1)):
-                _advance(snap, mem, u, goal, claimed, actions, ctx)
-            departures[bi] += 1
-            continue
+            counter_raid = (
+                tgt["owner"] in mem.aggressors
+                and len(combat) > 8
+                and grid.distance(here, goal) <= 12
+            )
+            campaign = (
+                endgame or snap.turn >= TREATY_CUTOFF_TURN - 40 or len(combat) > 12
+            ) and (offensive_type or len(combat) > 16)
+            if counter_raid or campaign:
+                if grid.distance(here, goal) > max(1, u.get("attack_range", 1)):
+                    _advance(snap, mem, u, goal, claimed, actions, ctx)
+                departures[bi] += 1
+                continue
 
         # peacetime / endgame posture: stay within the garrison ring
         ring = 2 if not endgame else 1
