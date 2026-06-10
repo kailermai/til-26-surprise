@@ -117,9 +117,15 @@ class ArenaRunner(GameRunner):
         self.participant_errors = 0
         self.first_error: str | None = None
         self.death_turn: int | None = None
+        self.progress = False  # live turn counter (serial runs only)
 
     async def _collect_actions(self, player_urls):  # type: ignore[override]
         state = self.state
+        if self.progress and state.turn_number % 10 == 0:
+            print(
+                f"\r       turn {state.turn_number}/{self.config.max_turns} ...",
+                end="", flush=True,
+            )
         # First turn we observe ourselves dead = (approximately) the turn we died.
         if self.death_turn is None and not state.players[PARTICIPANT_ID].alive:
             self.death_turn = state.turn_number
@@ -171,7 +177,8 @@ def _discard_recorder(runner: GameRunner, path: str) -> None:
         pass
 
 
-def run_one_game(agent_cls, seed, *, opp_cls, opponents, max_turns, map_w, map_h, save_replays):
+def run_one_game(agent_cls, seed, *, opp_cls, opponents, max_turns, map_w, map_h,
+                 save_replays, progress=False):
     random.seed(seed)  # pin opponents' (and the agent's) RNG -> seed N is reproducible
 
     opp_ids = [f"player-{i}" for i in range(1, opponents + 1)]
@@ -191,6 +198,7 @@ def run_one_game(agent_cls, seed, *, opp_cls, opponents, max_turns, map_w, map_h
     )
 
     runner = ArenaRunner(regs, config, actors)
+    runner.progress = progress
     runner.initialise()
     if not save_replays:
         _discard_recorder(runner, replay_path)
@@ -286,15 +294,18 @@ def main() -> None:
     print(f"{'seed':>5}  {'result':<9}{'death':>6}{'alive':>7}{'slow':>9}")
 
     results = []
+    progress = sys.stdout.isatty()  # live turn counter only in a real terminal
     for seed in seeds:
         r = run_one_game(
             agent_cls, seed,
             opp_cls=opp_cls, opponents=args.opponents, max_turns=args.max_turns,
-            map_w=map_w, map_h=map_h, save_replays=save_replays,
+            map_w=map_w, map_h=map_h, save_replays=save_replays, progress=progress,
         )
         results.append(r)
         death = "-" if r["death_turn"] is None else str(r["death_turn"])
         err = "  ERR" if r["errors"] else ""
+        if progress:
+            print("\r" + " " * 30 + "\r", end="")  # clear the turn-counter line
         print(
             f"{r['seed']:>5}  {'SURVIVED' if r['survived'] else 'died':<9}"
             f"{death:>6}{r['survivors']:>7}{r['slowest_turn']:>8.2f}s{err}"
